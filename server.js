@@ -13,29 +13,16 @@ const io = new Server(server, {
   }
 });
 
-// In-memory storage for users, chat logs, reports, and bans
+// In-memory storage for users, chat logs, reports, bans, and requests
 const waitingUsers = [];
 const pairedUsers = new Map();
 const chatLogs = new Map();
 const userReports = new Map(); // { userId: { count: number, lastReset: timestamp } }
 const userBans = new Map(); // { userId: { duration: number, start: timestamp } }
+const userRequests = []; // [{ id, userId, name, email, message, timestamp }]
 
-// Simple NSFW keyword filter (replace with external API like Perspective API if needed)
-const nsfwKeywords = [
-  'anal', 'bitch', 'biatch', 'blowjob', 'blow job', 'bollock', 'bollok', 'boner', 'boob', 'buttplug', 'clitoris', 'cock', 'coon', 'crap', 'cunt', 
-  'dick', 'dildo', 'dyke', 'fag', 'feck', 'fellate', 'fellatio', 'felching', 'fudgepacker', 'fudge packer', 'flange',
-  'homo', 'jerk', 'jizz', 'knobend', 'knob end', 'labia', 'muff',
-  'nigger', 'nigga', 'tosser', 'twat', 'wank', 'whore', 'deepthroat', 'doggy', 'dp', 'double penetration', '69', 'handjob', 'hand job',
-  'jackoff', 'jerkoff', 'masturbate', 'masturbation', 'nude', 'nudes',
-  'orgasm', 'oral', 'pegging', 'porn', 'porno', 'pornhub', 'rimjob', 'suck',
-  'sucking', 'tits', 'boobs', 'cum', 'creampie', 'gangbang', 'gagging', 'hooker',
-  'onlyfans', 'stripper', 'thot', 'tranny', 'xxx', 'xvideos', 'xhamster', 'camgirl',
-  'sexcam', 'camwhore', 'ejaculate', 'erection', 'fingering', 'grind', 'hardon',
-  'horny', 'intercourse', 'moan', 'moaning', 'nipple', 'orgy', 'panties', 'penetration',
-  'phat', 'playboy', 'pleasure', 'pornstar', 'raunchy', 'rawdog', 'shag',
-  'sloppy', 'strip', 'striptease', 'submissive', 'suckoff', 'swallow', 'teabag',
-  'topless', 'virginity', 'wet', 'wetdream', 'xxxvideos', 'pornhub', 'goon', 'shemale', 'tranny', 'niga'
-]; // Add more keywords as needed
+// Simple NSFW keyword filter (replace with external API if needed)
+const nsfwKeywords = ['explicit', 'nsfw', 'adult', 'inappropriate'];
 function isNSFW(message) {
   const lowerMsg = message.toLowerCase();
   return nsfwKeywords.some(keyword => lowerMsg.includes(keyword));
@@ -62,6 +49,12 @@ app.get('/admin/logs', adminAuth, (req, res) => {
     messages
   }));
   res.json(logs);
+});
+
+// Admin endpoint to view user requests
+app.get('/admin/requests', adminAuth, (req, res) => {
+  console.log('Admin requested user requests');
+  res.json(userRequests);
 });
 
 // Admin endpoint to ban user
@@ -180,7 +173,7 @@ io.on('connection', (socket) => {
 
       // Track reports
       let reports = userReports.get(partnerId) || { count: 0, lastReset: Date.now() };
-      if (Date.now() - reports.lastReset > 24 * 60 * 60 * 1000) { // Reset after 24 hours
+      if (Date.now() - reports.lastReset > 24 * 60 * 60 * 1000) {
         reports = { count: 0, lastReset: Date.now() };
       }
       reports.count += 1;
@@ -204,12 +197,12 @@ io.on('connection', (socket) => {
             partnerSocket.disconnect();
             console.log(`User ${partnerId} permanently banned`);
           } else if (reports.count >= 20) {
-            userBans.set(partnerId, { duration: 24 * 60 * 60 * 1000, start: Date.now() }); // 24 hours
+            userBans.set(partnerId, { duration: 24 * 60 * 60 * 1000, start: Date.now() });
             partnerSocket.emit('error', 'You are banned for 24 hours due to multiple reports.');
             partnerSocket.disconnect();
             console.log(`User ${partnerId} banned for 24 hours`);
           } else if (reports.count >= 10) {
-            userBans.set(partnerId, { duration: 30 * 60 * 1000, start: Date.now() }); // 30 minutes
+            userBans.set(partnerId, { duration: 30 * 60 * 1000, start: Date.now() });
             partnerSocket.emit('error', 'You are banned for 30 minutes due to multiple reports.');
             partnerSocket.disconnect();
             console.log(`User ${partnerId} banned for 30 minutes`);
@@ -233,6 +226,25 @@ io.on('connection', (socket) => {
         waitingUser.safeMode = safeMode;
       }
     }
+  });
+
+  socket.on('submit_request', ({ name, email, message }) => {
+    console.log(`Request from ${userId} (Socket ID: ${socket.id}):`, { name, email, message });
+    if (!message) {
+      socket.emit('error', 'Message is required for contact request.');
+      return;
+    }
+    const request = {
+      id: crypto.randomUUID(),
+      userId,
+      name: name || 'Anonymous',
+      email: email || 'N/A',
+      message,
+      timestamp: new Date().toISOString()
+    };
+    userRequests.push(request);
+    socket.emit('request_success', 'Your request has been submitted successfully.');
+    console.log(`Request stored: ${request.id}`);
   });
 
   socket.on('leave', () => {
