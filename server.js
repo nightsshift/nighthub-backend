@@ -85,7 +85,7 @@ io.on('connection', (socket) => {
     if (pair) {
       const pairId = pair.pairId;
       const partnerId = pair.partner;
-      const partnerSocketId = pairedUsers.get(partnerId)?.socketId; // Get partner's socketId
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
       console.log(`Sending message to partner ${partnerId} (Socket ID: ${partnerSocketId}) in pairId ${pairId}`);
       if (partnerSocketId) {
         const partnerSocket = io.sockets.sockets.get(partnerSocketId);
@@ -103,6 +103,23 @@ io.on('connection', (socket) => {
     } else {
       console.log(`No pair found for user ${userId} (Socket ID: ${socket.id})`);
       socket.emit('error', 'Not paired with anyone');
+    }
+  });
+
+  socket.on('typing', (isTyping) => {
+    console.log(`Typing event from ${userId} (Socket ID: ${socket.id}): ${isTyping}`);
+    const pair = pairedUsers.get(userId);
+    if (pair) {
+      const partnerId = pair.partner;
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
+      if (partnerSocketId) {
+        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+        if (partnerSocket) {
+          partnerSocket.emit('typing', isTyping);
+        } else {
+          console.log(`Partner socket ${partnerSocketId} not found for ${partnerId}`);
+        }
+      }
     }
   });
 
@@ -141,7 +158,7 @@ io.on('connection', (socket) => {
       }
       pairedUsers.delete(userId);
       pairedUsers.delete(partnerId);
-      chatLogs.delete(pairId); // Clean up chat logs
+      chatLogs.delete(pairId);
       socket.leave(pairId);
       console.log(`User ${userId} left pair ${pairId}`);
     } else {
@@ -170,7 +187,7 @@ io.on('connection', (socket) => {
       }
       pairedUsers.delete(userId);
       pairedUsers.delete(partnerId);
-      chatLogs.delete(pairId); // Clean up chat logs
+      chatLogs.delete(pairId);
       console.log(`Pair ${pairId} dissolved due to disconnect`);
     } else {
       const index = waitingUsers.findIndex((s) => s.id === userId);
