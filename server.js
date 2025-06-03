@@ -85,13 +85,19 @@ io.on('connection', (socket) => {
     if (pair) {
       const pairId = pair.pairId;
       const partnerId = pair.partner;
-      console.log(`Sending message to partner ${partnerId} in pairId ${pairId}`);
-      chatLogs.get(pairId).push({ userId, socketId: socket.id, message: msg, timestamp: new Date().toISOString() });
-      const partnerSocket = io.sockets.sockets.get(partnerId);
-      if (partnerSocket) {
-        partnerSocket.emit('message', msg); // Send only to partner
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId; // Get partner's socketId
+      console.log(`Sending message to partner ${partnerId} (Socket ID: ${partnerSocketId}) in pairId ${pairId}`);
+      if (partnerSocketId) {
+        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+        if (partnerSocket) {
+          partnerSocket.emit('message', msg);
+          chatLogs.get(pairId).push({ userId, socketId: socket.id, message: msg, timestamp: new Date().toISOString() });
+        } else {
+          console.log(`Partner socket ${partnerSocketId} not found for ${partnerId}`);
+          socket.emit('error', 'Partner disconnected');
+        }
       } else {
-        console.log(`Partner ${partnerId} not found`);
+        console.log(`No socketId found for partner ${partnerId}`);
         socket.emit('error', 'Partner disconnected');
       }
     } else {
@@ -113,7 +119,7 @@ io.on('connection', (socket) => {
       });
       console.log(`Report logged for pair ${pairId}`);
     } else {
-      console.log(`No pair found for report from ${userId} (Socket ID: ${socket.id})`);
+      console.log(`No partner found for report from ${userId} (Socket ID: ${socket.id})`);
       socket.emit('error', 'No user to report');
     }
   });
@@ -124,14 +130,18 @@ io.on('connection', (socket) => {
     if (pair) {
       const partnerId = pair.partner;
       const pairId = pair.pairId;
-      const partnerSocket = io.sockets.sockets.get(partnerId);
-      if (partnerSocket) {
-        partnerSocket.emit('disconnected');
-        partnerSocket.leave(pairId);
-        console.log(`Partner ${partnerId} notified and left room ${pairId}`);
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
+      if (partnerSocketId) {
+        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+        if (partnerSocket) {
+          partnerSocket.emit('disconnected');
+          partnerSocket.leave(pairId);
+          console.log(`Partner ${partnerId} notified and left room ${pairId}`);
+        }
       }
       pairedUsers.delete(userId);
       pairedUsers.delete(partnerId);
+      chatLogs.delete(pairId); // Clean up chat logs
       socket.leave(pairId);
       console.log(`User ${userId} left pair ${pairId}`);
     } else {
@@ -149,14 +159,18 @@ io.on('connection', (socket) => {
     if (pair) {
       const partnerId = pair.partner;
       const pairId = pair.pairId;
-      const partnerSocket = io.sockets.sockets.get(partnerId);
-      if (partnerSocket) {
-        partnerSocket.emit('disconnected');
-        partnerSocket.leave(pairId);
-        console.log(`Partner ${partnerId} notified and left room ${pairId}`);
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
+      if (partnerSocketId) {
+        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+        if (partnerSocket) {
+          partnerSocket.emit('disconnected');
+          partnerSocket.leave(pairId);
+          console.log(`Partner ${partnerId} notified and left room ${pairId}`);
+        }
       }
       pairedUsers.delete(userId);
       pairedUsers.delete(partnerId);
+      chatLogs.delete(pairId); // Clean up chat logs
       console.log(`Pair ${pairId} dissolved due to disconnect`);
     } else {
       const index = waitingUsers.findIndex((s) => s.id === userId);
