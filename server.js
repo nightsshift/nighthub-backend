@@ -85,9 +85,15 @@ io.on('connection', (socket) => {
     if (pair) {
       const pairId = pair.pairId;
       const partnerId = pair.partner;
-      console.log(`Broadcasting message to pairId ${pairId} for partner ${partnerId}`);
+      console.log(`Sending message to partner ${partnerId} in pairId ${pairId}`);
       chatLogs.get(pairId).push({ userId, socketId: socket.id, message: msg, timestamp: new Date().toISOString() });
-      io.to(pairId).emit('message', msg); // Use io.to to ensure all in room receive
+      const partnerSocket = io.sockets.sockets.get(partnerId);
+      if (partnerSocket) {
+        partnerSocket.emit('message', msg); // Send only to partner
+      } else {
+        console.log(`Partner ${partnerId} not found`);
+        socket.emit('error', 'Partner disconnected');
+      }
     } else {
       console.log(`No pair found for user ${userId} (Socket ID: ${socket.id})`);
       socket.emit('error', 'Not paired with anyone');
