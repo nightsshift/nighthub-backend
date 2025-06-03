@@ -13,10 +13,19 @@ const io = new Server(server, {
   }
 });
 
-// In-memory storage for users and chat logs
+// In-memory storage for users, chat logs, reports, and bans
 const waitingUsers = [];
 const pairedUsers = new Map();
 const chatLogs = new Map();
+const userReports = new Map(); // { userId: { count: number, lastReset: timestamp } }
+const userBans = new Map(); // { userId: { duration: number, start: timestamp } }
+
+// Simple NSFW keyword filter (replace with external API like Perspective API if needed)
+const nsfwKeywords = ['explicit', 'nsfw', 'adult', 'inappropriate']; // Add more keywords as needed
+function isNSFW(message) {
+  const lowerMsg = message.toLowerCase();
+  return nsfwKeywords.some(keyword => lowerMsg.includes(keyword));
+}
 
 // Admin authentication middleware
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'fallback-secret-for-testing';
@@ -47,7 +56,7 @@ app.post('/admin/ban/:socketId', adminAuth, (req, res) => {
   console.log(`Admin requested to ban socket: ${socketId}`);
   const socket = io.sockets.sockets.get(socketId);
   if (socket) {
-    socket.emit('error', 'You have been banned.');
+    socket.emit('error', 'You are banned.');
     socket.disconnect();
     res.send('User banned');
   } else {
@@ -59,14 +68,28 @@ io.on('connection', (socket) => {
   const userId = crypto.randomUUID();
   console.log(`User connected: ${userId} (Socket ID: ${socket.id})`);
 
+  // Check if user is banned
+  const ban = userBans.get(userId);
+  if (ban) {
+    const timeLeft = ban.start + ban.duration - Date.now();
+    if (timeLeft > 0) {
+      socket.emit('error', `You are banned for ${ban.duration === Infinity ? 'permanently' : `${Math.ceil(timeLeft / 60000)} minutes`}.`);
+      socket.disconnect();
+      return;
+    } else {
+      userBans.delete(userId);
+      userReports.delete(userId);
+    }
+  }
+
   socket.on('join', () => {
     console.log(`User ${userId} requested to join (Socket ID: ${socket.id})`);
     if (waitingUsers.length > 0) {
       const partner = waitingUsers.shift();
       const pairId = crypto.randomUUID();
       console.log(`Pairing ${userId} (Socket ID: ${socket.id}) with ${partner.id} (Socket ID: ${partner.socket.id}) (Pair ID: ${pairId})`);
-      pairedUsers.set(userId, { partner: partner.id, pairId, socketId: socket.id });
-      pairedUsers.set(partner.id, { partner: userId, pairId, socketId: partner.socket.id });
+      pairedUsers.set(userId, { partner: partner.id, pairId, socketId: socket.id, safeMode: true });
+      pairedUsers.set(partner.id, { partner: userId, pairId, socketId: partner.socket.id, safeMode: partner.safeMode });
       chatLogs.set(pairId, []);
       socket.join(pairId);
       partner.socket.join(pairId);
@@ -75,7 +98,7 @@ io.on('connection', (socket) => {
       console.log(`Users joined room ${pairId}`);
     } else {
       console.log(`User ${userId} added to waiting list (Socket ID: ${socket.id})`);
-      waitingUsers.push({ id: userId, socket });
+      waitingUsers.push({ id: userId, socket, safeMode: true });
     }
   });
 
@@ -86,6 +109,16 @@ io.on('connection', (socket) => {
       const pairId = pair.pairId;
       const partnerId = pair.partner;
       const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
+      const senderSafeMode = pair.safeMode;
+      const partnerSafeMode = pairedUsers.get(partnerId)?.safeMode;
+
+      // Check NSFW content if sender or partner has Safe Mode on
+      if ((senderSafeMode || partnerSafeMode) && isNSFW(msg)) {
+        socket.emit('error', 'Message blocked: Inappropriate content detected.');
+        chatLogs.get(pairId).push({ userId, socketId: socket.id, message: '[Blocked: NSFW]', timestamp: new Date().toISOString() });
+        return;
+      }
+
       console.log(`Sending message to partner ${partnerId} (Socket ID: ${partnerSocketId}) in pairId ${pairId}`);
       if (partnerSocketId) {
         const partnerSocket = io.sockets.sockets.get(partnerSocketId);
@@ -128,39 +161,101 @@ io.on('connection', (socket) => {
     const pair = pairedUsers.get(userId);
     if (pair) {
       const pairId = pair.pairId;
+      const partnerId = pair.partner;
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
+
+      // Track reports
+      let reports = userReports.get(partnerId) || { count: 0, lastReset: Date.now() };
+      if (Date.now() - reports.lastReset > 24 * 60 * 60 * 1000) { // Reset after 24 hours
+        reports = { count: 0, lastReset: Date.now() };
+      }
+      reports.count += 1;
+      userReports.set(partnerId, reports);
+
       chatLogs.get(pairId).push({
         userId,
         socketId: socket.id,
-        message: '[Reported]',
+        message: `[Reported user ${partnerId}]`,
         timestamp: data.timestamp || new Date().toISOString()
       });
-      console.log(`Report logged for pair ${pairId}`);
+      console.log(`Report logged for pair ${pairId}, user ${partnerId} now has ${reports.count} reports`);
+
+      // Apply bans based on report count
+      if (partnerSocketId) {
+        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+        if (partnerSocket) {
+          if (reports.count >= 30) {
+            userBans.set(partnerId, { duration: Infinity, start: Date.now() });
+            partnerSocket.emit('error', 'You are permanently banned due to multiple reports.');
+            partnerSocket.disconnect();
+            console.log(`User ${partnerId} permanently banned`);
+          } else if (reports.count >= 20) {
+            userBans.set(partnerId, { duration: 24 * 60 * 60 * 1000, start: Date.now() }); // 24 hours
+            partnerSocket.emit('error', 'You are banned for 24 hours due to multiple reports.');
+            partnerSocket.disconnect();
+            console.log(`User ${partnerId} banned for 24 hours`);
+          } else if (reports.count >= 10) {
+            userBans.set(partnerId, { duration: 30 * 60 * 1000, start: Date.now() }); // 30 minutes
+            partnerSocket.emit('error', 'You are banned for 30 minutes due to multiple reports.');
+            partnerSocket.disconnect();
+            console.log(`User ${partnerId} banned for 30 minutes`);
+          }
+        }
+      }
     } else {
       console.log(`No partner found for report from ${userId} (Socket ID: ${socket.id})`);
       socket.emit('error', 'No user to report');
     }
   });
 
-  socket.on('leave', () => {
-    console.log(`User ${userId} requested to leave (Socket ID: ${socket.id})`);
+  socket.on('toggle_safe_mode', (safeMode) => {
+    console.log(`User ${userId} toggled Safe Mode to ${safeMode} (Socket ID: ${socket.id})`);
     const pair = pairedUsers.get(userId);
     if (pair) {
-      const partnerId = pair.partner;
-      const pairId = pair.pairId;
-      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
-      if (partnerSocketId) {
-        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
-        if (partnerSocket) {
-          partnerSocket.emit('disconnected');
-          partnerSocket.leave(pairId);
-          console.log(`Partner ${partnerId} notified and left room ${pairId}`);
-        }
+      pairedUsers.set(userId, { ...pair, safeMode });
+    } else {
+      const waitingUser = waitingUsers.find(u => u.id === userId);
+      if (waitingUser) {
+        waitingUser.safeMode = safeMode;
       }
-      pairedUsers.delete(userId);
-      pairedUsers.delete(partnerId);
-      chatLogs.delete(pairId);
-      socket.leave(pairId);
-      console.log(`User ${userId} left pair ${pairId}`);
+    }
+  });
+
+  socket.on('leave', () => {
+    console.log(`User ${userId} initiated leave (Socket ID: ${socket.id})`);
+    const pair = pairedUsers.get(userId);
+    if (pair) {
+      const pairId = pair.pairId;
+      const partnerId = pair.partner;
+      const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
+      let countdown = 5;
+
+      const countdownInterval = setInterval(() => {
+        socket.emit('countdown', countdown);
+        if (partnerSocketId) {
+          const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+          if (partnerSocket) {
+            partnerSocket.emit('countdown', countdown);
+          }
+        }
+        countdown--;
+        if (countdown < 0) {
+          clearInterval(countdownInterval);
+          disconnectUser(userId, pairId, partnerId, partnerSocketId, socket);
+        }
+      }, 1000);
+
+      socket.once('cancel_disconnect', () => {
+        console.log(`User ${userId} cancelled disconnect (Socket ID: ${socket.id})`);
+        clearInterval(countdownInterval);
+        socket.emit('countdown_cancelled');
+        if (partnerSocketId) {
+          const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+          if (partnerSocket) {
+            partnerSocket.emit('countdown_cancelled');
+          }
+        }
+      });
     } else {
       const index = waitingUsers.findIndex((s) => s.id === userId);
       if (index !== -1) {
@@ -177,18 +272,7 @@ io.on('connection', (socket) => {
       const partnerId = pair.partner;
       const pairId = pair.pairId;
       const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
-      if (partnerSocketId) {
-        const partnerSocket = io.sockets.sockets.get(partnerSocketId);
-        if (partnerSocket) {
-          partnerSocket.emit('disconnected');
-          partnerSocket.leave(pairId);
-          console.log(`Partner ${partnerId} notified and left room ${pairId}`);
-        }
-      }
-      pairedUsers.delete(userId);
-      pairedUsers.delete(partnerId);
-      chatLogs.delete(pairId);
-      console.log(`Pair ${pairId} dissolved due to disconnect`);
+      disconnectUser(userId, pairId, partnerId, partnerSocketId, socket);
     } else {
       const index = waitingUsers.findIndex((s) => s.id === userId);
       if (index !== -1) {
@@ -197,6 +281,22 @@ io.on('connection', (socket) => {
       }
     }
   });
+
+  function disconnectUser(userId, pairId, partnerId, partnerSocketId, socket) {
+    if (partnerSocketId) {
+      const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+      if (partnerSocket) {
+        partnerSocket.emit('disconnected');
+        partnerSocket.leave(pairId);
+        console.log(`Partner ${partnerId} notified and left room ${pairId}`);
+      }
+    }
+    pairedUsers.delete(userId);
+    pairedUsers.delete(partnerId);
+    chatLogs.delete(pairId);
+    socket.leave(pairId);
+    console.log(`User ${userId} disconnected from pair ${pairId}`);
+  }
 });
 
 const PORT = process.env.PORT || 3000;
