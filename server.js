@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://nighthub.io', 'https://nightshift.github.io'], // Replace 'https://yourusername.github.io' with your GitHub Pages URL
+    origin: ['https://nighthub.io'], // Replace with your GitHub Pages URL if needed
     methods: ['GET', 'POST'],
     credentials: true
   }
@@ -16,14 +16,17 @@ const io = new Server(server, {
 // In-memory storage for users and chat logs
 const waitingUsers = [];
 const pairedUsers = new Map();
-const chatLogs = new Map(); // For admin/moderator access
+const chatLogs = new Map();
 
 // Admin authentication middleware
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'fallback-secret-for-testing';
 const adminAuth = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (authHeader === 'Bearer x7k9m2p8q3z5w1n4b6t2r8y0u3j5h9l2') { 
+  if (authHeader === `Bearer ${ADMIN_SECRET}`) {
+    console.log('Admin authenticated');
     next();
   } else {
+    console.log('Admin authentication failed');
     res.status(401).send('Unauthorized');
   }
 };
@@ -57,39 +60,42 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${userId} (Socket ID: ${socket.id})`);
 
   socket.on('join', () => {
-    console.log(`User ${userId} requested to join`);
+    console.log(`User ${userId} requested to join (Socket ID: ${socket.id})`);
     if (waitingUsers.length > 0) {
       const partner = waitingUsers.shift();
       const pairId = crypto.randomUUID();
-      console.log(`Pairing ${userId} with ${partner.id} (Pair ID: ${pairId})`);
+      console.log(`Pairing ${userId} (Socket ID: ${socket.id}) with ${partner.id} (Socket ID: ${partner.socket.id}) (Pair ID: ${pairId})`);
       pairedUsers.set(userId, { partner: partner.id, pairId, socketId: socket.id });
-      pairedUsers.set(partner.id, { partner: userId, pairId, socketId: partner.id });
+      pairedUsers.set(partner.id, { partner: userId, pairId, socketId: partner.socket.id });
       chatLogs.set(pairId, []);
       socket.join(pairId);
-      partner.join(pairId);
+      partner.socket.join(pairId);
       socket.emit('paired');
-      partner.emit('paired');
+      partner.socket.emit('paired');
+      console.log(`Users joined room ${pairId}`);
     } else {
-      console.log(`User ${userId} added to waiting list`);
+      console.log(`User ${userId} added to waiting list (Socket ID: ${socket.id})`);
       waitingUsers.push({ id: userId, socket });
     }
   });
 
   socket.on('message', (msg) => {
-    console.log(`Message from ${userId}: ${msg}`);
+    console.log(`Message from ${userId} (Socket ID: ${socket.id}): ${msg}`);
     const pair = pairedUsers.get(userId);
     if (pair) {
       const pairId = pair.pairId;
-      chatLogs.get(pairId).push({ userId, socketId: socket.id, message: msg, timestamp: new Date() });
-      socket.to(pairId).emit('message', msg);
+      const partnerId = pair.partner;
+      console.log(`Broadcasting message to pairId ${pairId} for partner ${partnerId}`);
+      chatLogs.get(pairId).push({ userId, socketId: socket.id, message: msg, timestamp: new Date().toISOString() });
+      io.to(pairId).emit('message', msg); // Use io.to to ensure all in room receive
     } else {
-      console.log(`No pair found for user ${userId}`);
+      console.log(`No pair found for user ${userId} (Socket ID: ${socket.id})`);
       socket.emit('error', 'Not paired with anyone');
     }
   });
 
   socket.on('report', (data) => {
-    console.log(`Report from ${userId}:`, data);
+    console.log(`Report from ${userId} (Socket ID: ${socket.id}):`, data);
     const pair = pairedUsers.get(userId);
     if (pair) {
       const pairId = pair.pairId;
@@ -101,12 +107,13 @@ io.on('connection', (socket) => {
       });
       console.log(`Report logged for pair ${pairId}`);
     } else {
-      console.log(`No pair found for report from ${userId}`);
+      console.log(`No pair found for report from ${userId} (Socket ID: ${socket.id})`);
+      socket.emit('error', 'No user to report');
     }
   });
 
   socket.on('leave', () => {
-    console.log(`User ${userId} requested to leave`);
+    console.log(`User ${userId} requested to leave (Socket ID: ${socket.id})`);
     const pair = pairedUsers.get(userId);
     if (pair) {
       const partnerId = pair.partner;
@@ -115,6 +122,7 @@ io.on('connection', (socket) => {
       if (partnerSocket) {
         partnerSocket.emit('disconnected');
         partnerSocket.leave(pairId);
+        console.log(`Partner ${partnerId} notified and left room ${pairId}`);
       }
       pairedUsers.delete(userId);
       pairedUsers.delete(partnerId);
@@ -139,6 +147,7 @@ io.on('connection', (socket) => {
       if (partnerSocket) {
         partnerSocket.emit('disconnected');
         partnerSocket.leave(pairId);
+        console.log(`Partner ${partnerId} notified and left room ${pairId}`);
       }
       pairedUsers.delete(userId);
       pairedUsers.delete(partnerId);
