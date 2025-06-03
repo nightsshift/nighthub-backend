@@ -21,7 +21,21 @@ const userReports = new Map(); // { userId: { count: number, lastReset: timestam
 const userBans = new Map(); // { userId: { duration: number, start: timestamp } }
 
 // Simple NSFW keyword filter (replace with external API like Perspective API if needed)
-const nsfwKeywords = ['explicit', 'nsfw', 'adult', 'inappropriate']; // Add more keywords as needed
+const nsfwKeywords = [
+  'anal', 'bitch', 'biatch', 'blowjob', 'blow job', 'bollock', 'bollok', 'boner', 'boob', 'buttplug', 'clitoris', 'cock', 'coon', 'crap', 'cunt', 
+  'dick', 'dildo', 'dyke', 'fag', 'feck', 'fellate', 'fellatio', 'felching', 'fudgepacker', 'fudge packer', 'flange',
+  'homo', 'jerk', 'jizz', 'knobend', 'knob end', 'labia', 'muff',
+  'nigger', 'nigga', 'tosser', 'twat', 'wank', 'whore', 'deepthroat', 'doggy', 'dp', 'double penetration', '69', 'handjob', 'hand job',
+  'jackoff', 'jerkoff', 'masturbate', 'masturbation', 'nude', 'nudes',
+  'orgasm', 'oral', 'pegging', 'porn', 'porno', 'pornhub', 'rimjob', 'suck',
+  'sucking', 'tits', 'boobs', 'cum', 'creampie', 'gangbang', 'gagging', 'hooker',
+  'onlyfans', 'stripper', 'thot', 'tranny', 'xxx', 'xvideos', 'xhamster', 'camgirl',
+  'sexcam', 'camwhore', 'ejaculate', 'erection', 'fingering', 'grind', 'hardon',
+  'horny', 'intercourse', 'moan', 'moaning', 'nipple', 'orgy', 'panties', 'penetration',
+  'phat', 'playboy', 'pleasure', 'pornstar', 'raunchy', 'rawdog', 'shag',
+  'sloppy', 'strip', 'striptease', 'submissive', 'suckoff', 'swallow', 'teabag',
+  'topless', 'virginity', 'wet', 'wetdream', 'xxxvideos', 'pornhub', 'goon', 'shemale', 'tranny', 'niga'
+]; // Add more keywords as needed
 function isNSFW(message) {
   const lowerMsg = message.toLowerCase();
   return nsfwKeywords.some(keyword => lowerMsg.includes(keyword));
