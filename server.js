@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://yourusername.github.io/nighthub', 'http://localhost:5500'],
+    origin: ['https://nighthub.io', 'http://localhost:5500'],
     methods: ['GET', 'POST']
   }
 });
