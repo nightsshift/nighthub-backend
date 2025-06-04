@@ -13,7 +13,7 @@ const io = new Server(server, {
   }
 });
 
-// In-memory storage for users, chat logs, reports, bans, requests, and tags
+// In-memory storage
 const waitingUsers = [];
 const pairedUsers = new Map();
 const chatLogs = new Map();
@@ -21,8 +21,14 @@ const userReports = new Map(); // { userId: { count: number, lastReset: timestam
 const userBans = new Map(); // { userId: { duration: number, start: timestamp } }
 const userRequests = []; // [{ id, userId, name, email, message, timestamp }]
 const tagUsage = new Map(); // { tag: { count: number, lastUsed: timestamp } }
+const adminSockets = new Set(); // Track admin socket IDs
+const adminChatObservers = new Map(); // { pairId: [socketIds] }
+const stats = {
+  messagesSent: 0,
+  reportsFiled: 0
+};
 
-// Simple NSFW keyword filter (replace with external API if needed)
+// Simple NSFW keyword filter
 const nsfwKeywords = ['explicit', 'nsfw', 'adult', 'inappropriate'];
 function isNSFW(message) {
   const lowerMsg = message.toLowerCase();
@@ -33,11 +39,11 @@ function isNSFW(message) {
 function sanitizeInput(input) {
   if (typeof input !== 'string') return '';
   return input.replace(/[<>&"']/g, (match) => ({
-    '<': '&lt;',
-    '>': '&gt;',
-    '&': '&amp;',
-    '"': '&quot;',
-    "'": '&#39;'
+    '<': '<',
+    '>': '>',
+    '&': '&',
+    '"': '"',
+    "'": '''
   }[match]));
 }
 
@@ -86,53 +92,76 @@ function findBestMatch(userId, socket, userTags, safeMode) {
   return bestMatch;
 }
 
-// Admin authentication middleware
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'fallback-secret-for-testing';
-const adminAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader === `Bearer ${ADMIN_SECRET}`) {
-    console.log('Admin authenticated');
-    next();
-  } else {
-    console.log('Admin authentication failed');
-    res.status(401).send('Unauthorized');
+// Get admin data
+function getAdminData() {
+  const users = [];
+  for (const [userId, data] of pairedUsers) {
+    const reports = userReports.get(userId) || { count: 0, lastReset: Date.now() };
+    const ban = userBans.get(userId);
+    users.push({
+      userId,
+      socketId: data.socketId,
+      reports: reports.count,
+      isBanned: !!ban,
+      banDuration: ban ? ban.duration : null,
+      banEnd: ban ? ban.start + ban.duration : null
+    });
   }
-};
+  for (const user of waitingUsers) {
+    const reports = userReports.get(user.id) || { count: 0, lastReset: Date.now() };
+    const ban = userBans.get(user.id);
+    users.push({
+      userId: user.id,
+      socketId: user.socket.id,
+      reports: reports.count,
+      isBanned: !!ban,
+      banDuration: ban ? ban.duration : null,
+      banEnd: ban ? ban.start + ban.duration : null
+    });
+  }
+
+  const chats = [];
+  const seenPairs = new Set();
+  for (const [userId, data] of pairedUsers) {
+    if (!seenPairs.has(data.pairId)) {
+      seenPairs.add(data.pairId);
+      const userIds = Array.from(pairedUsers.entries())
+        .filter(([_, d]) => d.pairId === data.pairId)
+        .map(([uId]) => uId);
+      const reports = userIds.reduce((sum, uId) => sum + (userReports.get(uId)?.count || 0), 0);
+      chats.push({
+        pairId: data.pairId,
+        userIds,
+        reports
+      });
+    }
+  }
+
+  return {
+    onlineUsers: pairedUsers.size + waitingUsers.length,
+    activeChats: chats.length,
+    messagesSent: stats.messagesSent,
+    reportsFiled: stats.reportsFiled,
+    users,
+    chats
+  };
+}
+
+// Broadcast admin data to all admin sockets
+function broadcastAdminData() {
+  const data = getAdminData();
+  adminSockets.forEach(socketId => {
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket) {
+      socket.emit('admin_data', data);
+    }
+  });
+}
 
 // Health check endpoint for Render
 app.get('/health', (req, res) => {
   console.log('Health check requested');
   res.status(200).send('OK');
-});
-
-// Admin endpoint to view chat logs
-app.get('/admin/logs', adminAuth, (req, res) => {
-  console.log('Admin requested logs');
-  const logs = Array.from(chatLogs.entries()).map(([pairId, messages]) => ({
-    pairId,
-    messages
-  }));
-  res.json(logs);
-});
-
-// Admin endpoint to view user requests
-app.get('/admin/requests', adminAuth, (req, res) => {
-  console.log('Admin requested user requests');
-  res.json(userRequests);
-});
-
-// Admin endpoint to ban user
-app.post('/admin/ban/:socketId', adminAuth, (req, res) => {
-  const { socketId } = req.params;
-  console.log(`Admin requested to ban socket: ${socketId}`);
-  const socket = io.sockets.sockets.get(socketId);
-  if (socket) {
-    socket.emit('error', 'You are banned.');
-    socket.disconnect();
-    res.send('User banned');
-  } else {
-    res.status(404).send('User not found');
-  }
 });
 
 io.on('connection', (socket) => {
@@ -152,6 +181,72 @@ io.on('connection', (socket) => {
       userReports.delete(userId);
     }
   }
+
+  // Admin login
+  socket.on('admin_login', ({ key }) => {
+    if (key === 'ekandmc') {
+      console.log(`Admin login successful, Socket ID: ${socket.id}`);
+      adminSockets.add(socket.id);
+      broadcastAdminData();
+    } else {
+      console.log(`Admin login failed, Socket ID: ${socket.id}`);
+      socket.emit('error', 'Invalid admin key.');
+    }
+  });
+
+  // Admin ban user
+  socket.on('admin_ban', ({ userId, duration }) => {
+    if (adminSockets.has(socket.id)) {
+      console.log(`Admin ban requested for ${userId} by ${socket.id}`);
+      userBans.set(userId, { duration, start: Date.now() });
+      const userSocket = io.sockets.sockets.get(pairedUsers.get(userId)?.socketId || waitingUsers.find(u => u.id === userId)?.socket.id);
+      if (userSocket) {
+        userSocket.emit('error', `You are banned for ${duration === Infinity ? 'permanently' : `${Math.ceil(duration / 60000)} minutes`}.`);
+        userSocket.disconnect();
+      }
+      broadcastAdminData();
+    }
+  });
+
+  // Admin unban user
+  socket.on('admin_unban', ({ userId }) => {
+    if (adminSockets.has(socket.id)) {
+      console.log(`Admin unban requested for ${userId} by ${socket.id}`);
+      userBans.delete(userId);
+      userReports.delete(userId);
+      broadcastAdminData();
+    }
+  });
+
+  // Admin observe chat
+  socket.on('admin_observe_chat', ({ pairId }) => {
+    if (adminSockets.has(socket.id)) {
+      console.log(`Admin observing chat ${pairId}, Socket ID: ${socket.id}`);
+      socket.join(pairId);
+      const observers = adminChatObservers.get(pairId) || [];
+      observers.push(socket.id);
+      adminChatObservers.set(pairId, observers);
+      const messages = chatLogs.get(pairId) || [];
+      messages.forEach(msg => {
+        socket.emit('admin_message', { pairId, userId: msg.userId, message: msg.message });
+      });
+    }
+  });
+
+  // Admin leave chat
+  socket.on('admin_leave_chat', ({ pairId }) => {
+    if (adminSockets.has(socket.id)) {
+      console.log(`Admin leaving chat ${pairId}, Socket ID: ${socket.id}`);
+      socket.leave(pairId);
+      const observers = adminChatObservers.get(pairId) || [];
+      const updatedObservers = observers.filter(id => id !== socket.id);
+      if (updatedObservers.length > 0) {
+        adminChatObservers.set(pairId, updatedObservers);
+      } else {
+        adminChatObservers.delete(pairId);
+      }
+    }
+  });
 
   socket.on('join', (userTags = []) => {
     console.log(`User ${userId} requested to join with tags: ${userTags} (Socket ID: ${socket.id})`);
@@ -190,9 +285,11 @@ io.on('connection', (socket) => {
       socket.emit('paired');
       match.socket.emit('paired');
       console.log(`Users joined room ${pairId}`);
+      broadcastAdminData();
     } else {
       console.log(`User ${userId} added to waiting list with tags: ${sanitizedTags} (Socket ID: ${socket.id})`);
       waitingUsers.push({ id: userId, socket, safeMode, tags: sanitizedTags });
+      broadcastAdminData();
     }
   });
 
@@ -221,6 +318,8 @@ io.on('connection', (socket) => {
       if ((senderSafeMode || partnerSafeMode) && isNSFW(sanitizedMsg)) {
         socket.emit('error', 'Message blocked: Inappropriate content detected.');
         chatLogs.get(pairId).push({ userId, socketId: socket.id, message: '[Blocked: NSFW]', timestamp: new Date().toISOString() });
+        stats.messagesSent++;
+        broadcastAdminData();
         return;
       }
 
@@ -230,6 +329,16 @@ io.on('connection', (socket) => {
         if (partnerSocket) {
           partnerSocket.emit('message', sanitizedMsg);
           chatLogs.get(pairId).push({ userId, socketId: socket.id, message: sanitizedMsg, timestamp: new Date().toISOString() });
+          stats.messagesSent++;
+          // Broadcast to admin observers
+          const observers = adminChatObservers.get(pairId) || [];
+          observers.forEach(socketId => {
+            const adminSocket = io.sockets.sockets.get(socketId);
+            if (adminSocket) {
+              adminSocket.emit('admin_message', { pairId, userId, message: sanitizedMsg });
+            }
+          });
+          broadcastAdminData();
         } else {
           console.log(`Partner socket ${partnerSocketId} not found for ${partnerId}`);
           socket.emit('error', 'Partner disconnected');
@@ -275,6 +384,7 @@ io.on('connection', (socket) => {
       }
       reports.count += 1;
       userReports.set(partnerId, reports);
+      stats.reportsFiled++;
 
       chatLogs.get(pairId).push({
         userId,
@@ -305,6 +415,7 @@ io.on('connection', (socket) => {
           }
         }
       }
+      broadcastAdminData();
     } else {
       console.log(`No partner found for report from ${userId} (Socket ID: ${socket.id})`);
       socket.emit('error', 'No user to report');
@@ -322,6 +433,7 @@ io.on('connection', (socket) => {
         waitingUser.safeMode = safeMode;
       }
     }
+    broadcastAdminData();
   });
 
   socket.on('submit_request', ({ name, email, message }) => {
@@ -342,6 +454,7 @@ io.on('connection', (socket) => {
     userRequests.push(request);
     socket.emit('request_success', 'Your request has been submitted successfully.');
     console.log(`Request stored: ${request.id}`);
+    broadcastAdminData();
   });
 
   socket.on('leave', () => {
@@ -378,18 +491,21 @@ io.on('connection', (socket) => {
             partnerSocket.emit('countdown_cancelled');
           }
         }
+        broadcastAdminData();
       });
     } else {
       const index = waitingUsers.findIndex((u) => u.id === userId);
       if (index !== -1) {
         waitingUsers.splice(index, 1);
         console.log(`User ${userId} removed from waiting list`);
+        broadcastAdminData();
       }
     }
   });
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${userId} (Socket ID: ${socket.id})`);
+    adminSockets.delete(socket.id);
     const pair = pairedUsers.get(userId);
     if (pair) {
       const partnerId = pair.partner;
@@ -403,6 +519,18 @@ io.on('connection', (socket) => {
         console.log(`User ${userId} removed from waiting list due to disconnect`);
       }
     }
+    // Clean up admin observers
+    const observingChats = Array.from(adminChatObservers.entries())
+      .filter(([_, sockets]) => sockets.includes(socket.id));
+    observingChats.forEach(([pairId, sockets]) => {
+      const updatedSockets = sockets.filter(id => id !== socket.id);
+      if (updatedSockets.length > 0) {
+        adminChatObservers.set(pairId, updatedSockets);
+      } else {
+        adminChatObservers.delete(pairId);
+      }
+    });
+    broadcastAdminData();
   });
 
   function disconnectUser(userId, pairId, partnerId, partnerSocketId, socket) {
@@ -419,6 +547,7 @@ io.on('connection', (socket) => {
     chatLogs.delete(pairId);
     socket.leave(pairId);
     console.log(`User ${userId} disconnected from pair ${pairId}`);
+    broadcastAdminData();
   }
 });
 
