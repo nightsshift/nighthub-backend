@@ -8,7 +8,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://yourusername.github.io/nighthub', 'http://localhost:5500'], // Replace with your GitHub Pages URL
+    origin: ['https://nightshift.github.io/nighthub', 'http://nighthub.io'], // Replace with your GitHub Pages URL
     methods: ['GET', 'POST'],
     credentials: true
   }
