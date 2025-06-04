@@ -1,555 +1,443 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const crypto = require('crypto');
+const mongoose = require('mongoose');
+const Filter = require('bad-words');
+const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://yourusername.github.io', 'http://localhost:5500'],
+    origin: '*',
     methods: ['GET', 'POST']
   }
 });
 
-const PORT = process.env.PORT || 3000;
+app.use(cors());
+app.use(express.static('public'));
 
-// In-memory storage
-const users = new Map();
-const chats = new Map();
-const requests = new Map();
-const tagUsers = new Map();
-const bannedUsers = new Map();
-const liveUsers = new Map();
-const videoUsers = new Set();
-let onlineUsers = 0;
-let activeChats = 0;
-let messagesSent = 0;
-let reportsFiled = 0;
+// MongoDB connection
+mongoose.connect('mongodb+srv://<username>:<password>@cluster0.mongodb.net/nighthub?retryWrites=true&w=majority', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-const nsfwWords = ['explicit', 'nsfw', 'adult', 'offensive'];
-
-function generateUserId() {
-  return crypto.randomBytes(16).toString('hex');
-}
-
-function sanitizeInput(input) {
-  return input.replace(/<[^>]*>/g, '');
-}
-
-function checkNSFW(message, safeMode) {
-  if (!safeMode) return false;
-  return nsfwWords.some(word => message.toLowerCase().includes(word));
-}
-
-function getTrendingTags() {
-  const tagCounts = new Map();
-  for (const [tag, userSet] of tagUsers) {
-    tagCounts.set(tag, userSet.size);
-  }
-  return [...tagCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(entry => entry[0]);
-}
-
-function addReport(userId) {
-  const user = users.get(userId);
-  if (user) {
-    user.reports = (user.reports || 0) + 1;
-    reportsFiled++;
-    if (user.reports >= 30) {
-      bannedUsers.set(userId, { duration: Infinity, end: Infinity });
-    } else if (user.reports >= 20) {
-      bannedUsers.set(userId, { duration: 24 * 60 * 60 * 1000, end: Date.now() + 24 * 60 * 60 * 1000 });
-    } else if (user.reports >= 10) {
-      bannedUsers.set(userId, { duration: 30 * 60 * 1000, end: Date.now() + 30 * 60 * 1000 });
-    }
-    if (bannedUsers.has(userId)) {
-      const socketId = user.socketId;
-      io.to(socketId).emit('error', `You have been banned for ${bannedUsers.get(userId).duration === Infinity ? 'permanently' : `${bannedUsers.get(userId).duration / 60000} minutes`}.`);
-      if (user.pairId) {
-        const pair = chats.get(user.pairId);
-        if (pair) {
-          const otherUserId = pair.userIds.find(id => id !== userId);
-          io.to(users.get(otherUserId).socketId).emit('disconnected');
-          chats.delete(user.pairId);
-          activeChats--;
-          users.get(otherUserId).pairId = null;
-        }
-      }
-      if (liveUsers.has(userId)) {
-        io.to(`live:${userId}`).emit('live_ended');
-        liveUsers.delete(userId);
-        io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
-      }
-      if (videoUsers.has(userId)) {
-        videoUsers.delete(userId);
-      }
-      socketId && io.sockets.sockets.get(socketId)?.disconnect();
-      users.delete(userId);
-      onlineUsers--;
-    }
-  }
-}
-
-function findMatch(userId, tags) {
-  for (const tag of tags) {
-    const usersWithTag = tagUsers.get(tag) || new Set();
-    for (const otherUserId of usersWithTag) {
-      if (otherUserId !== userId && !users.get(otherUserId).pairId) {
-        return otherUserId;
-      }
-    }
-  }
-  return null;
-}
-
-function findRandomVideoMatch(userId) {
-  for (const otherUserId of videoUsers) {
-    if (otherUserId !== userId && users.get(otherUserId)) {
-      return otherUserId;
-    }
-  }
-  return null;
-}
-
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+// Schemas
+const userSchema = new mongoose.Schema({
+  sessionId: String,
+  socketId: String,
+  tags: [String],
+  isBanned: { type: Boolean, default: false },
+  isAdmin: { type: Boolean, default: false }
 });
+const User = mongoose.model('User', userSchema);
 
+const postSchema = new mongoose.Schema({
+  text: String,
+  hashtags: [String],
+  upvotes: { type: Number, default: 0 },
+  downvotes: { type: Number, default: 0 },
+  userId: String,
+  anonymousId: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const Post = mongoose.model('Post', postSchema);
+
+const commentSchema = new mongoose.Schema({
+  postId: String,
+  parentId: String,
+  text: String,
+  upvotes: { type: Number, default: 0 },
+  downvotes: { type: Number, default: 0 },
+  userId: String,
+  anonymousId: String,
+  createdAt: { type: Date, default: Date.now }
+});
+const Comment = mongoose.model('Comment', commentSchema);
+
+const voteSchema = new mongoose.Schema({
+  userId: String,
+  postId: String,
+  commentId: String,
+  voteType: String // 'up' or 'down'
+});
+const Vote = mongoose.model('Vote', voteSchema);
+
+// NSFW filter
+const filter = new Filter();
+filter.addWords('sex', 'porn', 'nude', 'xxx'); // Extend as needed
+
+// State
+const users = new Map();
+const pairs = new Map();
+const waitingUsers = new Set();
+const waitingVideoUsers = new Set();
+
+// Utility functions
+function generateSessionId() {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+function generateAnonymousId() {
+  return 'Anon_' + Math.random().toString(36).substring(2, 10);
+}
+
+function extractHashtags(text) {
+  return (text.match(/#\w+/g) || []).map(tag => tag.slice(1).toLowerCase());
+}
+
+// Update trending hashtags every 5 minutes
+async function updateTrendingHashtags() {
+  const hashtags = await Post.aggregate([
+    { $unwind: '$hashtags' },
+    { $group: { _id: { hashtag: '$hashtags', userId: '$userId' } } },
+    { $group: { _id: '$_id.hashtag', userCount: { $sum: 1 } } },
+    { $sort: { userCount: -1 } },
+    { $limit: 10 }
+  ]);
+  io.emit('trending_update', hashtags.map(h => h._id));
+}
+setInterval(updateTrendingHashtags, 300000); // 5 minutes
+
+// Socket.IO connection
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
-  const userId = generateUserId();
-  users.set(userId, { socketId: socket.id, tags: [], safeMode: true, ageConfirmed: false });
-  onlineUsers++;
-  socket.userId = userId;
+  console.log('User connected:', socket.id);
 
-  socket.on('join', (tags) => {
-    if (bannedUsers.has(userId)) {
-      const ban = bannedUsers.get(userId);
-      socket.emit('error', `You are banned until ${new Date(ban.end).toISOString()}`);
+  // Initialize user
+  const sessionId = generateSessionId();
+  const user = new User({
+    sessionId,
+    socketId: socket.id,
+    tags: [],
+    isAdmin: socket.id === 'admin_socket_id' // Example admin check
+  });
+  user.save().then(() => {
+    users.set(socket.id, user);
+    socket.emit('admin_status', user.isAdmin);
+  });
+
+  socket.on('join', async (tags) => {
+    if (users.get(socket.id).isBanned) {
+      socket.emit('banned');
+      socket.disconnect();
       return;
     }
-    const sanitizedTags = tags.map(sanitizeInput).filter(tag => tag.length > 0);
-    users.get(userId).tags = sanitizedTags;
-    for (const tag of sanitizedTags) {
-      if (!tagUsers.has(tag)) tagUsers.set(tag, new Set());
-      tagUsers.get(tag).add(userId);
+    user.tags = tags.map(tag => tag.toLowerCase());
+    await user.save();
+    users.set(socket.id, user);
+    waitingUsers.add(socket.id);
+    waitingVideoUsers.add(socket.id);
+    socket.emit('waiting_for_pair');
+  });
+
+  socket.on('start_chat', async ({ pairId }) => {
+    if (pairs.has(socket.id)) {
+      socket.emit('error', 'Already in a chat');
+      return;
     }
-    const matchId = findMatch(userId, sanitizedTags);
-    if (matchId) {
-      const pairId = crypto.randomBytes(8).toString('hex');
-      users.get(userId).pairId = pairId;
-      users.get(matchId).pairId = pairId;
-      chats.set(pairId, { userIds: [userId, matchId], reports: 0 });
-      activeChats++;
-      io.to(socket.id).emit('paired', pairId);
-      io.to(users.get(matchId).socketId).emit('paired', pairId);
-    } else {
-      socket.emit('rejoin');
+    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned);
+    if (!partner) {
+      socket.emit('error', 'Partner not found');
+      return;
     }
+    pairs.set(socket.id, partner.socketId);
+    pairs.set(partner.socketId, socket.id);
+    waitingUsers.delete(socket.id);
+    waitingUsers.delete(partner.socketId);
+    socket.emit('paired', partner.sessionId);
+    io.to(partner.socketId).emit('paired', sessionId);
+  });
+
+  socket.on('start_random_chat', async () => {
+    if (pairs.has(socket.id)) {
+      socket.emit('error', 'Already in a chat');
+      return;
+    }
+    waitingUsers.delete(socket.id);
+    const availableUsers = Array.from(waitingUsers).filter(id => id !== socket.id && !users.get(id).isBanned);
+    if (availableUsers.length === 0) {
+      waitingUsers.add(socket.id);
+      socket.emit('waiting_for_pair');
+      return;
+    }
+    const partnerId = availableUsers[Math.floor(Math.random() * availableUsers.length)];
+    const partner = users.get(partnerId);
+    pairs.set(socket.id, partnerId);
+    pairs.set(partnerId, socket.id);
+    waitingUsers.delete(partnerId);
+    socket.emit('paired', partner.sessionId);
+    io.to(partnerId).emit('paired', sessionId);
+  });
+
+  socket.on('start_video_call', async ({ pairId }) => {
+    if (pairs.has(socket.id)) {
+      socket.emit('error', 'Already in a call');
+      return;
+    }
+    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned);
+    if (!partner) {
+      socket.emit('error', 'Partner not found');
+      return;
+    }
+    pairs.set(socket.id, partner.socketId);
+    pairs.set(partner.socketId, socket.id);
+    waitingVideoUsers.delete(socket.id);
+    waitingVideoUsers.delete(partner.socketId);
+    socket.emit('start_video_call', partner.sessionId);
+    io.to(partner.socketId).emit('start_video_call', sessionId);
+  });
+
+  socket.on('start_random_video', async () => {
+    if (pairs.has(socket.id)) {
+      socket.emit('error', 'Already in a call');
+      return;
+    }
+    waitingVideoUsers.delete(socket.id);
+    const availableUsers = Array.from(waitingVideoUsers).filter(id => id !== socket.id && !users.get(id).isBanned);
+    if (availableUsers.length === 0) {
+      waitingVideoUsers.add(socket.id);
+      socket.emit('waiting_for_pair');
+      return;
+    }
+    const partnerId = availableUsers[Math.floor(Math.random() * availableUsers.length)];
+    const partner = users.get(partnerId);
+    pairs.set(socket.id, partnerId);
+    pairs.set(partnerId, socket.id);
+    waitingVideoUsers.delete(partnerId);
+    socket.emit('paired', partner.sessionId);
+    io.to(partnerId).emit('paired', sessionId);
   });
 
   socket.on('message', (msg) => {
-    const user = users.get(userId);
-    if (!user || !user.pairId) {
-      socket.emit('error', 'Not in a chat');
-      return;
-    }
-    const sanitizedMsg = sanitizeInput(msg);
-    if (checkNSFW(sanitizedMsg, user.safeMode)) {
-      socket.emit('error', 'Message blocked by NSFW filter');
-      return;
-    }
-    const pair = chats.get(user.pairId);
-    if (pair) {
-      const otherUserId = pair.userIds.find(id => id !== userId);
-      io.to(users.get(otherUserId).socketId).emit('message', sanitizedMsg);
-      messagesSent++;
-      io.to(users.get(userId).socketId).emit('admin_message', { pairId: user.pairId, userId, message: sanitizedMsg });
-      io.to(users.get(otherUserId).socketId).emit('admin_message', { pairId: user.pairId, userId, message: sanitizedMsg });
-    }
-  });
-
-  socket.on('typing', (isTyping) => {
-    const user = users.get(userId);
-    if (user && user.pairId) {
-      const pair = chats.get(user.pairId);
-      if (pair) {
-        const otherUserId = pair.userIds.find(id => id !== userId);
-        io.to(users.get(otherUserId).socketId).emit('typing', isTyping);
-      }
-    }
-  });
-
-  socket.on('leave', () => {
-    const user = users.get(userId);
-    if (user && user.pairId) {
-      const pairId = user.pairId;
-      const pair = chats.get(pairId);
-      if (pair) {
-        const otherUserId = pair.userIds.find(id => id !== userId);
-        const otherUser = users.get(otherUserId);
-        io.to(users.get(otherUserId).socketId).emit('disconnected');
-        chats.delete(pairId);
-        activeChats--;
-        users.get(otherUserId).pairId = null;
-        user.pairId = null;
-        if (videoUsers.has(userId)) {
-          videoUsers.delete(userId);
-        }
-        if (videoUsers.has(otherUserId)) {
-          videoUsers.delete(otherUserId);
-        }
-        // Re-pair both users
-        const userTags = user.tags;
-        const otherUserTags = otherUser?.tags || [];
-        if (userTags.length > 0) {
-          socket.emit('rejoin');
-        }
-        if (otherUserTags.length > 0) {
-          io.to(users.get(otherUserId).socketId).emit('rejoin');
-        }
-      }
-    }
-  });
-
-  socket.on('report', ({ timestamp }) => {
-    const user = users.get(userId);
-    if (user && user.pairId) {
-      const pair = chats.get(user.pairId);
-      if (pair) {
-        pair.reports = (pair.reports || 0) + 1;
-        const otherUserId = pair.userIds.find(id => id !== userId);
-        addReport(otherUserId);
-      }
-    }
-  });
-
-  socket.on('submit_request', ({ name, email, message }) => {
-    const requestId = crypto.randomBytes(8).toString('hex');
-    requests.set(requestId, {
-      name: sanitizeInput(name || 'Anonymous'),
-      email: sanitizeInput(email || 'No email provided'),
-      message: sanitizeInput(message),
-      timestamp: new Date().toISOString()
-    });
-    socket.emit('request_success', 'Request submitted successfully');
-    console.log(`Request stored: ${requestId}`);
-  });
-
-  socket.on('get_trending_tags', () => {
-    socket.emit('trending_tags', getTrendingTags());
-  });
-
-  socket.on('admin_login', ({ key }) => {
-    if (key === 'ekandmc') {
-      socket.join('admin');
-      socket.emit('admin_data', {
-        onlineUsers,
-        activeChats,
-        messagesSent,
-        reportsFiled,
-        users: [...users.entries()].map(([id, user]) => ({
-          userId: id,
-          socketId: user.socketId,
-          reports: user.reports || 0,
-          isBanned: bannedUsers.has(id),
-          banDuration: bannedUsers.get(id)?.duration,
-          banEnd: bannedUsers.get(id)?.end
-        })),
-        chats: [...chats.entries()].map(([pairId, chat]) => ({
-          pairId,
-          userIds: chat.userIds,
-          reports: chat.reports || 0
-        })),
-        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
-          userId,
-          title,
-          viewers,
-          isBanned: bannedUsers.has(userId)
-        }))
-      });
-    } else {
-      socket.emit('error', 'Invalid admin key');
-    }
-  });
-
-  socket.on('admin_ban', ({ userId, duration }) => {
-    if (socket.rooms.has('admin')) {
-      bannedUsers.set(userId, { duration, end: Date.now() + duration });
-      addReport(userId);
-      io.emit('admin_data', {
-        onlineUsers,
-        activeChats,
-        messagesSent,
-        reportsFiled,
-        users: [...users.entries()].map(([id, user]) => ({
-          userId: id,
-          socketId: user.socketId,
-          reports: user.reports || 0,
-          isBanned: bannedUsers.has(id),
-          banDuration: bannedUsers.get(id)?.duration,
-          banEnd: bannedUsers.get(id)?.end
-        })),
-        chats: [...chats.entries()].map(([pairId, chat]) => ({
-          pairId,
-          userIds: chat.userIds,
-          reports: chat.reports || 0
-        })),
-        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
-          userId,
-          title,
-          viewers,
-          isBanned: bannedUsers.has(userId)
-        }))
-      });
-    }
-  });
-
-  socket.on('admin_unban', ({ userId }) => {
-    if (socket.rooms.has('admin')) {
-      bannedUsers.delete(userId);
-      const user = users.get(userId);
-      if (user) {
-        user.reports = 0;
-        io.to(user.socketId).emit('request_success', 'You have been unbanned');
-      }
-      io.emit('admin_data', {
-        onlineUsers,
-        activeChats,
-        messagesSent,
-        reportsFiled,
-        users: [...users.entries()].map(([id, user]) => ({
-          userId: id,
-          socketId: user.socketId,
-          reports: user.reports || 0,
-          isBanned: bannedUsers.has(id),
-          banDuration: bannedUsers.get(id)?.duration,
-          banEnd: bannedUsers.get(id)?.end
-        })),
-        chats: [...chats.entries()].map(([pairId, chat]) => ({
-          pairId,
-          userIds: chat.userIds,
-          reports: chat.reports || 0
-        })),
-        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
-          userId,
-          title,
-          viewers,
-          isBanned: bannedUsers.has(userId)
-        }))
-      });
-    }
-  });
-
-  socket.on('admin_ban_live', ({ userId, duration }) => {
-    if (socket.rooms.has('admin')) {
-      bannedUsers.set(userId, { duration, end: Date.now() + duration });
-      if (liveUsers.has(userId)) {
-        io.to(`live:${userId}`).emit('live_ended');
-        liveUsers.delete(userId);
-        io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
-      }
-      addReport(userId);
-      io.emit('admin_data', {
-        onlineUsers,
-        activeChats,
-        messagesSent,
-        reportsFiled,
-        users: [...users.entries()].map(([id, user]) => ({
-          userId: id,
-          socketId: user.socketId,
-          reports: user.reports || 0,
-          isBanned: bannedUsers.has(id),
-          banDuration: bannedUsers.get(id)?.duration,
-          banEnd: bannedUsers.get(id)?.end
-        })),
-        chats: [...chats.entries()].map(([pairId, chat]) => ({
-          pairId,
-          userIds: chat.userIds,
-          reports: chat.reports || 0
-        })),
-        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
-          userId,
-          title,
-          viewers,
-          isBanned: bannedUsers.has(userId)
-        }))
-      });
-    }
-  });
-
-  socket.on('admin_unban_live', ({ userId }) => {
-    if (socket.rooms.has('admin')) {
-      bannedUsers.delete(userId);
-      const user = users.get(userId);
-      if (user) {
-        user.reports = 0;
-        io.to(user.socketId).emit('request_success', 'You have been unbanned from live streaming');
-      }
-      io.emit('admin_data', {
-        onlineUsers,
-        activeChats,
-        messagesSent,
-        reportsFiled,
-        users: [...users.entries()].map(([id, user]) => ({
-          userId: id,
-          socketId: user.socketId,
-          reports: user.reports || 0,
-          isBanned: bannedUsers.has(id),
-          banDuration: bannedUsers.get(id)?.duration,
-          banEnd: bannedUsers.get(id)?.end
-        })),
-        chats: [...chats.entries()].map(([pairId, chat]) => ({
-          pairId,
-          userIds: chat.userIds,
-          reports: chat.reports || 0
-        })),
-        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
-          userId,
-          title,
-          viewers,
-          isBanned: bannedUsers.has(userId)
-        }))
-      });
-    }
-  });
-
-  socket.on('admin_observe_chat', ({ pairId }) => {
-    if (socket.rooms.has('admin')) {
-      socket.join(`chat:${pairId}`);
-    }
-  });
-
-  socket.on('admin_leave_chat', ({ pairId }) => {
-    if (socket.rooms.has('admin')) {
-      socket.leave(`chat:${pairId}`);
-    }
-  });
-
-  socket.on('start_video_call', ({ pairId }) => {
-    const user = users.get(userId);
-    if (user && pairId && user.pairId === pairId) {
-      const pair = chats.get(pairId);
-      if (pair) {
-        const otherUserId = pair.userIds.find(id => id !== userId);
-        io.to(users.get(otherUserId).socketId).emit('start_video_call', pairId);
-      }
-    } else {
-      socket.emit('error', 'Invalid pair for video call');
-    }
-  });
-
-  socket.on('start_random_video', () => {
-    if (bannedUsers.has(userId)) {
-      const ban = bannedUsers.get(userId);
-      socket.emit('error', `You are banned until ${new Date(ban.end).toISOString()}`);
-      return;
-    }
-    if (!videoUsers.has(userId)) {
-      videoUsers.add(userId);
-      const matchId = findRandomVideoMatch(userId);
-      if (matchId) {
-        const pairId = crypto.randomBytes(8).toString('hex');
-        users.get(userId).pairId = pairId;
-        users.get(matchId).pairId = pairId;
-        chats.set(pairId, { userIds: [userId, matchId], reports: 0 });
-        activeChats++;
-        videoUsers.delete(userId);
-        videoUsers.delete(matchId);
-        io.to(socket.id).emit('paired', pairId);
-        io.to(users.get(matchId).socketId).emit('paired', pairId);
-      } else {
-        socket.emit('waiting_for_pair');
-      }
+    const partnerId = pairs.get(socket.id);
+    if (partnerId) {
+      io.to(partnerId).emit('message', msg);
     }
   });
 
   socket.on('webrtc_signal', (data) => {
-    const user = users.get(userId);
-    if (user && user.pairId) {
-      const pair = chats.get(user.pairId);
-      if (pair) {
-        const otherUserId = pair.userIds.find(id => id !== userId);
-        io.to(users.get(otherUserId).socketId).emit('webrtc_signal', data);
-      }
-    } else if (data.liveId) {
-      io.to(`live:${data.liveId}`).emit('webrtc_signal', { signal: data.signal });
+    const partnerId = pairs.get(socket.id);
+    if (partnerId) {
+      io.to(partnerId).emit('webrtc_signal', data);
     }
   });
 
-  socket.on('start_live', ({ userId, title }) => {
-    if (bannedUsers.has(userId)) {
-      const ban = bannedUsers.get(userId);
-      socket.emit('error', `You are banned from live streaming until ${new Date(ban.end).toISOString()}`);
+  socket.on('new_post', async (text) => {
+    if (users.get(socket.id).isBanned) {
+      socket.emit('banned');
       return;
     }
-    liveUsers.set(userId, { viewers: 0, title: sanitizeInput(title || 'Live Stream') });
-    io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
-  });
-
-  socket.on('join_live', ({ liveId }) => {
-    socket.join(`live:${liveId}`);
-    if (liveUsers.has(liveId)) {
-      liveUsers.get(liveId).viewers++;
-      io.to(`live:${liveId}`).emit('viewer_count', liveUsers.get(liveId).viewers);
+    const words = text.split(/\s+/).filter(w => w).length;
+    if (words > 100) {
+      socket.emit('error', 'Post exceeds 100 words');
+      return;
     }
-  });
-
-  socket.on('leave_live', ({ liveId }) => {
-    socket.leave(`live:${liveId}`);
-    if (liveUsers.has(liveId)) {
-      liveUsers.get(liveId).viewers = Math.max(0, liveUsers.get(liveId).viewers - 1);
-      io.to(`live:${liveId}`).emit('viewer_count', liveUsers.get(liveId).viewers);
+    if (filter.isProfane(text)) {
+      socket.emit('error', 'Post contains inappropriate content');
+      return;
     }
+    const hashtags = extractHashtags(text);
+    const post = new Post({
+      text,
+      hashtags,
+      userId: sessionId,
+      anonymousId: generateAnonymousId()
+    });
+    await post.save();
+    io.emit('post', { ...post.toObject(), comments: [] });
   });
 
-  socket.on('live_comment', ({ liveId, comment }) => {
-    io.to(`live:${liveId}`).emit('live_comment', { userId: socket.id, comment: sanitizeInput(comment) });
+  socket.on('new_comment', async ({ postId, parentId, text }) => {
+    if (users.get(socket.id).isBanned) {
+      socket.emit('banned');
+      return;
+    }
+    if (filter.isProfane(text)) {
+      socket.emit('error', 'Comment contains inappropriate content');
+      return;
+    }
+    const comment = new Comment({
+      postId,
+      parentId,
+      text,
+      userId: sessionId,
+      anonymousId: generateAnonymousId()
+    });
+    await comment.save();
+    io.emit('comment', { postId, comment: comment.toObject() });
   });
 
-  socket.on('get_live_list', () => {
-    socket.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
+  socket.on('vote_post', async ({ id, vote }) => {
+    if (users.get(socket.id).isBanned) {
+      socket.emit('banned');
+      return;
+    }
+    const existingVote = await Vote.findOne({ userId: sessionId, postId: id });
+    if (existingVote) {
+      socket.emit('error', 'Already voted');
+      return;
+    }
+    const post = await Post.findById(id);
+    if (!post) {
+      socket.emit('error', 'Post not found');
+      return;
+    }
+    if (vote === 'up') {
+      post.upvotes += 1;
+    } else {
+      post.downvotes += 1;
+    }
+    await post.save();
+    await new Vote({ userId: sessionId, postId: id, voteType: vote }).save();
+    io.emit('vote_update', { type: 'post', id, upvotes: post.upvotes, downvotes: post.downvotes });
+  });
+
+  socket.on('vote_comment', async ({ id, vote }) => {
+    if (users.get(socket.id).isBanned) {
+      socket.emit('banned');
+      return;
+    }
+    const existingVote = await Vote.findOne({ userId: sessionId, commentId: id });
+    if (existingVote) {
+      socket.emit('error', 'Already voted');
+      return;
+    }
+    const comment = await Comment.findById(id);
+    if (!comment) {
+      socket.emit('error', 'Comment not found');
+      return;
+    }
+    if (vote === 'up') {
+      comment.upvotes += 1;
+    } else {
+      comment.downvotes += 1;
+    }
+    await comment.save();
+    await new Vote({ userId: sessionId, commentId: id, voteType: vote }).save();
+    io.emit('vote_update', { type: 'comment', id, upvotes: comment.upvotes, downvotes: comment.downvotes });
+  });
+
+  socket.on('get_trending', async () => {
+    // Trigger immediate update
+    await updateTrendingHashtags();
+  });
+
+  socket.on('get_randos', async () => {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const posts = await Post.find({ createdAt: { $gte: startOfDay } })
+      .sort({ createdAt: -1 })
+      .limit(10);
+    const postsWithComments = await Promise.all(posts.map(async post => ({
+      ...post.toObject(),
+      comments: await Comment.find({ postId: post._id, parentId: null })
+    })));
+    socket.emit('randos_update', postsWithComments);
+  });
+
+  socket.on('get_new', async () => {
+    const posts = await Post.find()
+      .sort({ createdAt: -1 })
+      .limit(10);
+    const postsWithComments = await Promise.all(posts.map(async post => ({
+      ...post.toObject(),
+      comments: await Comment.find({ postId: post._id, parentId: null })
+    })));
+    socket.emit('new_posts', postsWithComments);
+  });
+
+  socket.on('get_hashtag_posts', async (hashtag) => {
+    const posts = await Post.find({ hashtags: hashtag.toLowerCase() })
+      .sort({ createdAt: -1 })
+      .limit(10);
+    const postsWithComments = await Promise.all(posts.map(async post => ({
+      ...post.toObject(),
+      comments: await Comment.find({ postId: post._id, parentId: null })
+    })));
+    socket.emit('hashtag_posts', postsWithComments);
+  });
+
+  socket.on('admin_ban', async (userId) => {
+    if (!users.get(socket.id).isAdmin) {
+      socket.emit('error', 'Not authorized');
+      return;
+    }
+    const user = await User.findOne({ sessionId: userId });
+    if (!user) {
+      socket.emit('error', 'User not found');
+      return;
+    }
+    user.isBanned = true;
+    await user.save();
+    io.to(user.socketId).emit('banned');
+    io.to(user.socketId).disconnectSockets();
+  });
+
+  socket.on('get_trending_tags', async () => {
+    const tags = await User.aggregate([
+      { $unwind: '$tags' },
+      { $group: { _id: '$tags', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 }
+    ]);
+    socket.emit('trending_tags', tags.map(t => t._id));
+  });
+
+  socket.on('leave', () => {
+    const partnerId = pairs.get(socket.id);
+    if (partnerId) {
+      io.to(partnerId).emit('disconnected');
+      pairs.delete(partnerId);
+    }
+    pairs.delete(socket.id);
+    waitingUsers.delete(socket.id);
+    waitingVideoUsers.delete(socket.id);
   });
 
   socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.id}`);
-    const user = users.get(userId);
-    if (user) {
-      for (const tag of user.tags) {
-        tagUsers.get(tag)?.delete(userId);
-      }
-      if (user.pairId) {
-        const pair = chats.get(user.pairId);
-        if (pair) {
-          const otherUserId = pair.userIds.find(id => id !== userId);
-          io.to(users.get(otherUserId).socketId).emit('disconnected');
-          chats.delete(user.pairId);
-          activeChats--;
-          users.get(otherUserId).pairId = null;
-          const otherUser = users.get(otherUserId);
-          if (otherUser && otherUser.tags.length > 0) {
-            io.to(users.get(otherUserId).socketId).emit('rejoin');
-          }
-        }
-      }
-      if (liveUsers.has(userId)) {
-        io.to(`live:${userId}`).emit('live_ended');
-        liveUsers.delete(userId);
-        io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
-      }
-      if (videoUsers.has(userId)) {
-        videoUsers.delete(userId);
-      }
-      users.delete(userId);
-      onlineUsers--;
-      io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
+    const partnerId = pairs.get(socket.id);
+    if (partnerId) {
+      io.to(partnerId).emit('disconnected');
+      pairs.delete(partnerId);
     }
+    pairs.delete(socket.id);
+    waitingUsers.delete(socket.id);
+    waitingVideoUsers.delete(socket.id);
+    users.delete(socket.id);
+    User.deleteOne({ socketId: socket.id }).exec();
+    console.log('User disconnected:', socket.id);
   });
 });
 
+// Intervals for Randos and New posts
+setInterval(async () => {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const posts = await Post.find({ createdAt: { $gte: startOfDay } })
+    .sort({ createdAt: -1 })
+    .limit(10);
+  const postsWithComments = await Promise.all(posts.map(async post => ({
+    ...post.toObject(),
+    comments: await Comment.find({ postId: post._id, parentId: null })
+  })));
+  io.emit('randos_update', postsWithComments);
+}, 60000);
+
+setInterval(async () => {
+  const posts = await Post.find()
+    .sort({ createdAt: -1 })
+    .limit(10);
+  const postsWithComments = await Promise.all(posts.map(async post => ({
+    ...post.toObject(),
+    comments: await Comment.find({ postId: post._id, parentId: null })
+  })));
+  io.emit('new_posts', postsWithComments);
+}, 1000);
+
+// Start server
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server running on http://0.0.0.0:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
