@@ -2,13 +2,12 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const crypto = require('crypto');
-const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://nightshift.github.io/nighthub', 'http://nighthub.io'], // Replace with your GitHub Pages URL
+    origin: ['https://nighthub.io/chat', 'http://localhost:5500'], // Replace with your GitHub Pages URL
     methods: ['GET', 'POST'],
     credentials: true
   }
@@ -43,11 +42,11 @@ function isNSFW(message) {
 function sanitizeInput(input) {
   if (typeof input !== 'string') return '';
   return input.replace(/[<>&"']/g, match => ({
-    '<': '&lt;',
-    '>': '&gt;',
-    '&': '&amp;',
-    '"': '&quot;',
-    "'": '&#39;'
+    '<': '<',
+    '>': '>',
+    '&': '&',
+    '"': '"',
+    "'": '''
   }[match]));
 }
 
@@ -161,19 +160,6 @@ function broadcastAdminData() {
   });
 }
 
-// Check VPN usage
-async function checkVPN(socket) {
-  try {
-    const ip = socket.handshake.address;
-    const response = await axios.get(`https://ipapi.co/${ip}/json/`);
-    const data = response.data;
-    return data.hosting || data.vpn || data.proxy;
-  } catch (err) {
-    console.error(`VPN check error for ${socket.id}:`, err.message);
-    return false;
-  }
-}
-
 // Apply ban
 function applyBan(userId, socket, duration, fingerprint, ip, reason) {
   userBans.set(userId, { duration, start: Date.now() });
@@ -198,26 +184,19 @@ io.on('connection', (socket) => {
   const ip = socket.handshake.address;
   console.log(`User connected: ${userId} (Socket ID: ${socket.id}, IP: ${ip})`);
 
-  // Check device ban and IP history
+  // Check bans
   socket.on('device_fingerprint', (fingerprint) => {
     const deviceBan = deviceBans.get(fingerprint);
     const ipBan = ipHistory.get(ip);
+    const userBan = userBans.get(userId);
     const isDeviceBanned = deviceBan && (deviceBan.start + deviceBan.duration > Date.now());
     const isIpBanned = ipBan && (ipBan.start + ipBan.duration > Date.now());
+    const isUserBanned = userBan && (userBan.start + userBan.duration > Date.now());
 
-    if (isDeviceBanned || isIpBanned) {
-      const ban = isDeviceBanned ? deviceBan : ipBan;
+    if (isDeviceBanned || isIpBanned || isUserBanned) {
+      const ban = isDeviceBanned ? deviceBan : (isIpBanned ? ipBan : userBan);
       const timeLeft = ban.start + ban.duration - Date.now();
       socket.emit('error', `You are banned for ${ban.duration === Infinity ? 'permanently' : `${Math.ceil(timeLeft / 60000)} minutes`}.`);
-      socket.disconnect();
-      return;
-    }
-  });
-
-  // Check VPN
-  checkVPN(socket).then(isVPN => {
-    if (isVPN) {
-      socket.emit('error', 'Please disable your VPN to start chatting.');
       socket.disconnect();
     }
   });
@@ -429,9 +408,9 @@ io.on('connection', (socket) => {
       userId,
       socketId: socket.id,
       message: `[Reported user ${partnerId}]`,
-      timestamp: data.timestamp || new Date().toISOString()
+      timestamp: data?.timestamp || new Date().toISOString()
     });
-    console.log(`Report logged for ${partnerId}: ${reports.count} reports (${socket.id})`);
+    console.log(`Report logged for ${partnerId}: ${reports.count} reports`);
 
     if (partnerSocketId) {
       const partnerSocket = io.sockets.sockets.get(partnerSocketId);
