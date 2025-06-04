@@ -13,7 +13,7 @@ const io = new Server(server, {
   }
 });
 
-// In-memory storage for users, chat logs, reports, bans, requests, tags, and quotes
+// In-memory storage for users, chat logs, reports, bans, requests, and tags
 const waitingUsers = [];
 const pairedUsers = new Map();
 const chatLogs = new Map();
@@ -21,8 +21,6 @@ const userReports = new Map(); // { userId: { count: number, lastReset: timestam
 const userBans = new Map(); // { userId: { duration: number, start: timestamp } }
 const userRequests = []; // [{ id, userId, name, email, message, timestamp }]
 const tagUsage = new Map(); // { tag: { count: number, lastUsed: timestamp } }
-const quotes = []; // [{ id, text, timestamp, votes }]
-let quoteIdCounter = 0;
 
 // Simple NSFW keyword filter (replace with external API if needed)
 const nsfwKeywords = ['explicit', 'nsfw', 'adult', 'inappropriate'];
@@ -39,13 +37,8 @@ function sanitizeInput(input) {
     '>': '&gt;',
     '&': '&amp;',
     '"': '&quot;',
-    "'": '&#x27;'
+    "'": '&#39;'
   }[match]));
-}
-
-// Generate unique quote ID
-function generateQuoteId() {
-  return quoteIdCounter++;
 }
 
 // Track tag usage
@@ -207,50 +200,6 @@ io.on('connection', (socket) => {
     const trendingTags = getTrendingTags();
     console.log(`Sending trending tags to ${userId} (Socket ID: ${socket.id}): ${trendingTags}`);
     socket.emit('trending_tags', trendingTags);
-  });
-
-  socket.on('save_quote', (text) => {
-    console.log(`Quote save request from ${userId} (Socket ID: ${socket.id}): ${text}`);
-    const sanitizedText = sanitizeInput(text);
-    if (!sanitizedText) {
-      socket.emit('error', 'Quote cannot be empty.');
-      return;
-    }
-    if (sanitizedText.length > 500) {
-      socket.emit('error', 'Quote is too long (max 500 characters).');
-      return;
-    }
-    const quote = {
-      id: generateQuoteId(),
-      text: sanitizedText,
-      timestamp: new Date().toISOString(),
-      votes: 0
-    };
-    quotes.push(quote);
-    socket.emit('quote_saved', 'Quote saved to vault.');
-    io.emit('vault_quotes', quotes);
-    console.log(`Quote saved with ID ${quote.id}`);
-  });
-
-  socket.on('vote_quote', ({ quoteId, voteType }) => {
-    console.log(`Vote request from ${userId} (Socket ID: ${socket.id}) for quote ${quoteId}: ${voteType}`);
-    const quote = quotes.find(q => q.id === parseInt(quoteId));
-    if (quote) {
-      if (voteType === 'upvote') {
-        quote.votes += 1;
-      } else if (voteType === 'downvote') {
-        quote.votes -= 1;
-      }
-      io.emit('vault_quotes', quotes);
-      console.log(`Quote ${quoteId} now has ${quote.votes} votes`);
-    } else {
-      socket.emit('error', 'Quote not found.');
-    }
-  });
-
-  socket.on('get_vault_quotes', () => {
-    console.log(`Vault quotes requested by ${userId} (Socket ID: ${socket.id})`);
-    socket.emit('vault_quotes', quotes);
   });
 
   socket.on('message', (msg) => {
@@ -431,7 +380,7 @@ io.on('connection', (socket) => {
         }
       });
     } else {
-      const index = waitingUsers.findIndex(u => u.id === userId);
+      const index = waitingUsers.findIndex((u) => u.id === userId);
       if (index !== -1) {
         waitingUsers.splice(index, 1);
         console.log(`User ${userId} removed from waiting list`);
@@ -448,7 +397,7 @@ io.on('connection', (socket) => {
       const partnerSocketId = pairedUsers.get(partnerId)?.socketId;
       disconnectUser(userId, pairId, partnerId, partnerSocketId, socket);
     } else {
-      const index = waitingUsers.findIndex(u => u.id === userId);
+      const index = waitingUsers.findIndex((u) => u.id === userId);
       if (index !== -1) {
         waitingUsers.splice(index, 1);
         console.log(`User ${userId} removed from waiting list due to disconnect`);
