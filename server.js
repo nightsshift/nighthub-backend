@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://yourusername.github.io/nighthub', 'http://localhost:5500'],
+    origin: ['https://nighthub.io', 'http://localhost:5500'],
     methods: ['GET', 'POST']
   }
 });
@@ -21,6 +21,7 @@ const requests = new Map();
 const tagUsers = new Map();
 const bannedUsers = new Map();
 const liveUsers = new Map(); // Stores { viewers: number, title: string }
+const videoUsers = new Set(); // Stores users waiting for random video call
 let onlineUsers = 0;
 let activeChats = 0;
 let messagesSent = 0;
@@ -82,6 +83,9 @@ function addReport(userId) {
         liveUsers.delete(userId);
         io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
       }
+      if (videoUsers.has(userId)) {
+        videoUsers.delete(userId);
+      }
       socketId && io.sockets.sockets.get(socketId)?.disconnect();
       users.delete(userId);
       onlineUsers--;
@@ -96,6 +100,15 @@ function findMatch(userId, tags) {
       if (otherUserId !== userId && !users.get(otherUserId).pairId) {
         return otherUserId;
       }
+    }
+  }
+  return null;
+}
+
+function findRandomVideoMatch(userId) {
+  for (const otherUserId of videoUsers) {
+    if (otherUserId !== userId && users.get(otherUserId)) {
+      return otherUserId;
     }
   }
   return null;
@@ -131,8 +144,8 @@ io.on('connection', (socket) => {
       users.get(matchId).pairId = pairId;
       chats.set(pairId, { userIds: [userId, matchId], reports: 0 });
       activeChats++;
-      io.to(socket.id).emit('paired');
-      io.to(users.get(matchId).socketId).emit('paired');
+      io.to(socket.id).emit('paired', pairId);
+      io.to(users.get(matchId).socketId).emit('paired', pairId);
     } else {
       socket.emit('rejoin');
     }
@@ -190,6 +203,9 @@ io.on('connection', (socket) => {
             users.get(otherUserId).pairId = null;
             socket.emit('rejoin');
             user.pairId = null;
+            if (videoUsers.has(userId)) {
+              videoUsers.delete(userId);
+            }
           }
         }, 1000);
         socket.countdown = countdown;
@@ -426,13 +442,40 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('start_video_call', () => {
+  socket.on('start_video_call', ({ pairId }) => {
     const user = users.get(userId);
-    if (user && user.pairId) {
-      const pair = chats.get(user.pairId);
+    if (user && pairId && user.pairId === pairId) {
+      const pair = chats.get(pairId);
       if (pair) {
         const otherUserId = pair.userIds.find(id => id !== userId);
-        io.to(users.get(otherUserId).socketId).emit('start_video_call');
+        io.to(users.get(otherUserId).socketId).emit('start_video_call', pairId);
+      }
+    } else {
+      socket.emit('error', 'Invalid pair for video call');
+    }
+  });
+
+  socket.on('start_random_video', () => {
+    if (bannedUsers.has(userId)) {
+      const ban = bannedUsers.get(userId);
+      socket.emit('error', `You are banned until ${new Date(ban.end).toISOString()}`);
+      return;
+    }
+    if (!videoUsers.has(userId)) {
+      videoUsers.add(userId);
+      const matchId = findRandomVideoMatch(userId);
+      if (matchId) {
+        const pairId = crypto.randomBytes(8).toString('hex');
+        users.get(userId).pairId = pairId;
+        users.get(matchId).pairId = pairId;
+        chats.set(pairId, { userIds: [userId, matchId], reports: 0 });
+        activeChats++;
+        videoUsers.delete(userId);
+        videoUsers.delete(matchId);
+        io.to(socket.id).emit('paired', pairId);
+        io.to(users.get(matchId).socketId).emit('paired', pairId);
+      } else {
+        socket.emit('waiting_for_pair');
       }
     }
   });
@@ -505,6 +548,9 @@ io.on('connection', (socket) => {
         io.to(`live:${userId}`).emit('live_ended');
         liveUsers.delete(userId);
         io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
+      }
+      if (videoUsers.has(userId)) {
+        videoUsers.delete(userId);
       }
       users.delete(userId);
       onlineUsers--;
