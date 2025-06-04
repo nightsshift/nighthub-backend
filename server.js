@@ -30,6 +30,7 @@ const userSchema = new mongoose.Schema({
   socketId: String,
   tags: [String],
   isBanned: { type: Boolean, default: false },
+  banUntil: Date,
   isAdmin: { type: Boolean, default: false }
 });
 const User = mongoose.model('User', userSchema);
@@ -67,7 +68,7 @@ const Vote = mongoose.model('Vote', voteSchema);
 
 // NSFW filter
 const filter = new Filter();
-filter.addWords('sex', 'porn', 'nude', 'xxx'); // Extend as needed
+filter.addWords('sex', 'porn', 'nude', 'xxx');
 
 // State
 const users = new Map();
@@ -99,7 +100,7 @@ async function updateTrendingHashtags() {
   ]);
   io.emit('trending_update', hashtags.map(h => h._id));
 }
-setInterval(updateTrendingHashtags, 300000); // 5 minutes
+setInterval(updateTrendingHashtags, 300000);
 
 // Socket.IO connection
 io.on('connection', (socket) => {
@@ -119,7 +120,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join', async (tags) => {
-    if (users.get(socket.id).isBanned) {
+    const now = new Date();
+    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > now)) {
       socket.emit('banned');
       socket.disconnect();
       return;
@@ -137,7 +139,7 @@ io.on('connection', (socket) => {
       socket.emit('error', 'Already in a chat');
       return;
     }
-    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned);
+    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned && (!u.banUntil || u.banUntil <= new Date()));
     if (!partner) {
       socket.emit('error', 'Partner not found');
       return;
@@ -156,7 +158,8 @@ io.on('connection', (socket) => {
       return;
     }
     waitingUsers.delete(socket.id);
-    const availableUsers = Array.from(waitingUsers).filter(id => id !== socket.id && !users.get(id).isBanned);
+    const now = new Date();
+    const availableUsers = Array.from(waitingUsers).filter(id => id !== socket.id && !users.get(id).isBanned && (!users.get(id).banUntil || users.get(id).banUntil <= now));
     if (availableUsers.length === 0) {
       waitingUsers.add(socket.id);
       socket.emit('waiting_for_pair');
@@ -176,7 +179,7 @@ io.on('connection', (socket) => {
       socket.emit('error', 'Already in a call');
       return;
     }
-    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned);
+    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned && (!u.banUntil || u.banUntil <= new Date()));
     if (!partner) {
       socket.emit('error', 'Partner not found');
       return;
@@ -195,7 +198,8 @@ io.on('connection', (socket) => {
       return;
     }
     waitingVideoUsers.delete(socket.id);
-    const availableUsers = Array.from(waitingVideoUsers).filter(id => id !== socket.id && !users.get(id).isBanned);
+    const now = new Date();
+    const availableUsers = Array.from(waitingVideoUsers).filter(id => id !== socket.id && !users.get(id).isBanned && (!users.get(id).banUntil || users.get(id).banUntil <= now));
     if (availableUsers.length === 0) {
       waitingVideoUsers.add(socket.id);
       socket.emit('waiting_for_pair');
@@ -225,7 +229,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('new_post', async (text) => {
-    if (users.get(socket.id).isBanned) {
+    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
       socket.emit('banned');
       return;
     }
@@ -250,7 +254,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('new_comment', async ({ postId, parentId, text }) => {
-    if (users.get(socket.id).isBanned) {
+    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
       socket.emit('banned');
       return;
     }
@@ -270,7 +274,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('vote_post', async ({ id, vote }) => {
-    if (users.get(socket.id).isBanned) {
+    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
       socket.emit('banned');
       return;
     }
@@ -295,7 +299,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('vote_comment', async ({ id, vote }) => {
-    if (users.get(socket.id).isBanned) {
+    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
       socket.emit('banned');
       return;
     }
@@ -320,7 +324,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('get_trending', async () => {
-    // Trigger immediate update
     await updateTrendingHashtags();
   });
 
@@ -359,7 +362,45 @@ io.on('connection', (socket) => {
     socket.emit('hashtag_posts', postsWithComments);
   });
 
-  socket.on('admin_ban', async (userId) => {
+  socket.on('delete_post', async (postId) => {
+    if (!users.get(socket.id).isAdmin) {
+      socket.emit('error', 'Not authorized');
+      return;
+    }
+    await Post.findByIdAndDelete(postId);
+    await Comment.deleteMany({ postId });
+    await Vote.deleteMany({ postId });
+    io.emit('post_deleted', postId);
+  });
+
+  socket.on('delete_comment', async (commentId) => {
+    if (!users.get(socket.id).isAdmin) {
+      socket.emit('error', 'Not authorized');
+      return;
+    }
+    await Comment.findByIdAndDelete(commentId);
+    await Comment.deleteMany({ parentId: commentId });
+    await Vote.deleteMany({ commentId });
+    io.emit('comment_deleted', commentId);
+  });
+
+  socket.on('temp_ban', async ({ userId, duration }) => {
+    if (!users.get(socket.id).isAdmin) {
+      socket.emit('error', 'Not authorized');
+      return;
+    }
+    const user = await User.findOne({ sessionId: userId });
+    if (!user) {
+      socket.emit('error', 'User not found');
+      return;
+    }
+    user.banUntil = new Date(Date.now() + duration * 60 * 60 * 1000);
+    await user.save();
+    io.to(user.socketId).emit('banned');
+    io.to(user.socketId).disconnectSockets();
+  });
+
+  socket.on('perm_ban', async (userId) => {
     if (!users.get(socket.id).isAdmin) {
       socket.emit('error', 'Not authorized');
       return;
@@ -370,9 +411,18 @@ io.on('connection', (socket) => {
       return;
     }
     user.isBanned = true;
+    user.banUntil = null;
     await user.save();
     io.to(user.socketId).emit('banned');
     io.to(user.socketId).disconnectSockets();
+  });
+
+  socket.on('send_announcement', async (text) => {
+    if (!users.get(socket.id).isAdmin) {
+      socket.emit('error', 'Not authorized');
+      return;
+    }
+    io.emit('announcement', text);
   });
 
   socket.on('get_trending_tags', async () => {
