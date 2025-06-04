@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://nighthub.io', 'http://localhost:5500'],
+    origin: ['https://yourusername.github.io', 'http://localhost:5500'],
     methods: ['GET', 'POST']
   }
 });
@@ -20,8 +20,8 @@ const chats = new Map();
 const requests = new Map();
 const tagUsers = new Map();
 const bannedUsers = new Map();
-const liveUsers = new Map(); // Stores { viewers: number, title: string }
-const videoUsers = new Set(); // Stores users waiting for random video call
+const liveUsers = new Map();
+const videoUsers = new Set();
 let onlineUsers = 0;
 let activeChats = 0;
 let messagesSent = 0;
@@ -189,40 +189,27 @@ io.on('connection', (socket) => {
       const pairId = user.pairId;
       const pair = chats.get(pairId);
       if (pair) {
-        let seconds = 5;
-        const countdown = setInterval(() => {
-          socket.emit('countdown', seconds);
-          io.to(users.get(pair.userIds.find(id => id !== userId)).socketId).emit('countdown', seconds);
-          seconds--;
-          if (seconds < 0) {
-            clearInterval(countdown);
-            const otherUserId = pair.userIds.find(id => id !== userId);
-            io.to(users.get(otherUserId).socketId).emit('disconnected');
-            chats.delete(pairId);
-            activeChats--;
-            users.get(otherUserId).pairId = null;
-            socket.emit('rejoin');
-            user.pairId = null;
-            if (videoUsers.has(userId)) {
-              videoUsers.delete(userId);
-            }
-          }
-        }, 1000);
-        socket.countdown = countdown;
-      }
-    }
-  });
-
-  socket.on('cancel_disconnect', () => {
-    if (socket.countdown) {
-      clearInterval(socket.countdown);
-      const user = users.get(userId);
-      if (user && user.pairId) {
-        const pair = chats.get(user.pairId);
-        if (pair) {
-          const otherUserId = pair.userIds.find(id => id !== userId);
-          io.to(socket.id).emit('countdown_cancelled');
-          io.to(users.get(otherUserId).socketId).emit('countdown_cancelled');
+        const otherUserId = pair.userIds.find(id => id !== userId);
+        const otherUser = users.get(otherUserId);
+        io.to(users.get(otherUserId).socketId).emit('disconnected');
+        chats.delete(pairId);
+        activeChats--;
+        users.get(otherUserId).pairId = null;
+        user.pairId = null;
+        if (videoUsers.has(userId)) {
+          videoUsers.delete(userId);
+        }
+        if (videoUsers.has(otherUserId)) {
+          videoUsers.delete(otherUserId);
+        }
+        // Re-pair both users
+        const userTags = user.tags;
+        const otherUserTags = otherUser?.tags || [];
+        if (userTags.length > 0) {
+          socket.emit('rejoin');
+        }
+        if (otherUserTags.length > 0) {
+          io.to(users.get(otherUserId).socketId).emit('rejoin');
         }
       }
     }
@@ -542,6 +529,10 @@ io.on('connection', (socket) => {
           chats.delete(user.pairId);
           activeChats--;
           users.get(otherUserId).pairId = null;
+          const otherUser = users.get(otherUserId);
+          if (otherUser && otherUser.tags.length > 0) {
+            io.to(users.get(otherUserId).socketId).emit('rejoin');
+          }
         }
       }
       if (liveUsers.has(userId)) {
