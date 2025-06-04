@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://nighthub.io', 'http://localhost:5500'],
+    origin: ['https://yourusername.github.io/nighthub', 'http://localhost:5500'],
     methods: ['GET', 'POST']
   }
 });
@@ -20,7 +20,7 @@ const chats = new Map();
 const requests = new Map();
 const tagUsers = new Map();
 const bannedUsers = new Map();
-const liveUsers = new Set();
+const liveUsers = new Map(); // Changed to Map to store viewer counts
 let onlineUsers = 0;
 let activeChats = 0;
 let messagesSent = 0;
@@ -319,12 +319,24 @@ io.on('connection', (socket) => {
 
   // Live streaming
   socket.on('start_live', ({ userId: liveUserId }) => {
-    liveUsers.add(liveUserId);
-    io.emit('live_list', Array.from(liveUsers));
+    liveUsers.set(liveUserId, { viewers: 0 });
+    io.emit('live_list', [...liveUsers.keys()]);
   });
 
   socket.on('join_live', ({ liveId }) => {
     socket.join(`live:${liveId}`);
+    if (liveUsers.has(liveId)) {
+      liveUsers.get(liveId).viewers++;
+      io.to(`live:${liveId}`).emit('viewer_count', liveUsers.get(liveId).viewers);
+    }
+  });
+
+  socket.on('leave_live', ({ liveId }) => {
+    socket.leave(`live:${liveId}`);
+    if (liveUsers.has(liveId)) {
+      liveUsers.get(liveId).viewers = Math.max(0, liveUsers.get(liveId).viewers - 1);
+      io.to(`live:${liveId}`).emit('viewer_count', liveUsers.get(liveId).viewers);
+    }
   });
 
   socket.on('live_comment', ({ liveId, comment }) => {
@@ -332,7 +344,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('get_live_list', () => {
-    socket.emit('live_list', Array.from(liveUsers));
+    socket.emit('live_list', [...liveUsers.keys()]);
   });
 
   socket.on('disconnect', () => {
@@ -352,10 +364,13 @@ io.on('connection', (socket) => {
           users.get(otherUserId).pairId = null;
         }
       }
-      liveUsers.delete(userId);
-      io.emit('live_list', Array.from(liveUsers));
+      if (liveUsers.has(userId)) {
+        io.to(`live:${userId}`).emit('live_ended');
+        liveUsers.delete(userId);
+      }
       users.delete(userId);
       onlineUsers--;
+      io.emit('live_list', [...liveUsers.keys()]);
     }
   });
 });
