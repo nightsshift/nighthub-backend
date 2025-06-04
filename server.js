@@ -7,10 +7,16 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://nighthub.io', 'http://localhost:5500'], // Supports nighthub.io/chat.html
+    origin: ['https://nighthub.io', 'http://localhost:5500'],
     methods: ['GET', 'POST'],
     credentials: true
   }
+});
+
+// Set Permissions-Policy header
+app.use((req, res, next) => {
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  next();
 });
 
 // In-memory storage
@@ -42,11 +48,11 @@ function isNSFW(message) {
 function sanitizeInput(input) {
   if (typeof input !== 'string') return '';
   return input.replace(/[<>&"']/g, match => ({
-    '<': '&lt;',
-    '>': '&gt;',
-    '&': '&amp;',
-    '"': '&quot;',
-    "'": '&#39;'
+    '<': '<',
+    '>': '>',
+    '&': '&',
+    '"': '"',
+    "'": '''
   }[match]));
 }
 
