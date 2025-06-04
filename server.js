@@ -20,7 +20,7 @@ const chats = new Map();
 const requests = new Map();
 const tagUsers = new Map();
 const bannedUsers = new Map();
-const liveUsers = new Map(); // Changed to Map to store viewer counts
+const liveUsers = new Map(); // Stores { viewers: number, title: string }
 let onlineUsers = 0;
 let activeChats = 0;
 let messagesSent = 0;
@@ -76,6 +76,11 @@ function addReport(userId) {
           activeChats--;
           users.get(otherUserId).pairId = null;
         }
+      }
+      if (liveUsers.has(userId)) {
+        io.to(`live:${userId}`).emit('live_ended');
+        liveUsers.delete(userId);
+        io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
       }
       socketId && io.sockets.sockets.get(socketId)?.disconnect();
       users.delete(userId);
@@ -255,6 +260,12 @@ io.on('connection', (socket) => {
           pairId,
           userIds: chat.userIds,
           reports: chat.reports || 0
+        })),
+        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
+          userId,
+          title,
+          viewers,
+          isBanned: bannedUsers.has(userId)
         }))
       });
     } else {
@@ -266,6 +277,31 @@ io.on('connection', (socket) => {
     if (socket.rooms.has('admin')) {
       bannedUsers.set(userId, { duration, end: Date.now() + duration });
       addReport(userId);
+      io.emit('admin_data', {
+        onlineUsers,
+        activeChats,
+        messagesSent,
+        reportsFiled,
+        users: [...users.entries()].map(([id, user]) => ({
+          userId: id,
+          socketId: user.socketId,
+          reports: user.reports || 0,
+          isBanned: bannedUsers.has(id),
+          banDuration: bannedUsers.get(id)?.duration,
+          banEnd: bannedUsers.get(id)?.end
+        })),
+        chats: [...chats.entries()].map(([pairId, chat]) => ({
+          pairId,
+          userIds: chat.userIds,
+          reports: chat.reports || 0
+        })),
+        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
+          userId,
+          title,
+          viewers,
+          isBanned: bannedUsers.has(userId)
+        }))
+      });
     }
   });
 
@@ -277,6 +313,104 @@ io.on('connection', (socket) => {
         user.reports = 0;
         io.to(user.socketId).emit('request_success', 'You have been unbanned');
       }
+      io.emit('admin_data', {
+        onlineUsers,
+        activeChats,
+        messagesSent,
+        reportsFiled,
+        users: [...users.entries()].map(([id, user]) => ({
+          userId: id,
+          socketId: user.socketId,
+          reports: user.reports || 0,
+          isBanned: bannedUsers.has(id),
+          banDuration: bannedUsers.get(id)?.duration,
+          banEnd: bannedUsers.get(id)?.end
+        })),
+        chats: [...chats.entries()].map(([pairId, chat]) => ({
+          pairId,
+          userIds: chat.userIds,
+          reports: chat.reports || 0
+        })),
+        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
+          userId,
+          title,
+          viewers,
+          isBanned: bannedUsers.has(userId)
+        }))
+      });
+    }
+  });
+
+  socket.on('admin_ban_live', ({ userId, duration }) => {
+    if (socket.rooms.has('admin')) {
+      bannedUsers.set(userId, { duration, end: Date.now() + duration });
+      if (liveUsers.has(userId)) {
+        io.to(`live:${userId}`).emit('live_ended');
+        liveUsers.delete(userId);
+        io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
+      }
+      addReport(userId);
+      io.emit('admin_data', {
+        onlineUsers,
+        activeChats,
+        messagesSent,
+        reportsFiled,
+        users: [...users.entries()].map(([id, user]) => ({
+          userId: id,
+          socketId: user.socketId,
+          reports: user.reports || 0,
+          isBanned: bannedUsers.has(id),
+          banDuration: bannedUsers.get(id)?.duration,
+          banEnd: bannedUsers.get(id)?.end
+        })),
+        chats: [...chats.entries()].map(([pairId, chat]) => ({
+          pairId,
+          userIds: chat.userIds,
+          reports: chat.reports || 0
+        })),
+        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
+          userId,
+          title,
+          viewers,
+          isBanned: bannedUsers.has(userId)
+        }))
+      });
+    }
+  });
+
+  socket.on('admin_unban_live', ({ userId }) => {
+    if (socket.rooms.has('admin')) {
+      bannedUsers.delete(userId);
+      const user = users.get(userId);
+      if (user) {
+        user.reports = 0;
+        io.to(user.socketId).emit('request_success', 'You have been unbanned from live streaming');
+      }
+      io.emit('admin_data', {
+        onlineUsers,
+        activeChats,
+        messagesSent,
+        reportsFiled,
+        users: [...users.entries()].map(([id, user]) => ({
+          userId: id,
+          socketId: user.socketId,
+          reports: user.reports || 0,
+          isBanned: bannedUsers.has(id),
+          banDuration: bannedUsers.get(id)?.duration,
+          banEnd: bannedUsers.get(id)?.end
+        })),
+        chats: [...chats.entries()].map(([pairId, chat]) => ({
+          pairId,
+          userIds: chat.userIds,
+          reports: chat.reports || 0
+        })),
+        liveStreams: [...liveUsers.entries()].map(([userId, { title, viewers }]) => ({
+          userId,
+          title,
+          viewers,
+          isBanned: bannedUsers.has(userId)
+        }))
+      });
     }
   });
 
@@ -292,7 +426,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Video call signaling
   socket.on('start_video_call', () => {
     const user = users.get(userId);
     if (user && user.pairId) {
@@ -313,14 +446,18 @@ io.on('connection', (socket) => {
         io.to(users.get(otherUserId).socketId).emit('webrtc_signal', data);
       }
     } else if (data.liveId) {
-      io.to(`live:${data.liveId}`).emit('webrtc_signal', data.signal);
+      io.to(`live:${data.liveId}`).emit('webrtc_signal', { signal: data.signal });
     }
   });
 
-  // Live streaming
-  socket.on('start_live', ({ userId: liveUserId }) => {
-    liveUsers.set(liveUserId, { viewers: 0 });
-    io.emit('live_list', [...liveUsers.keys()]);
+  socket.on('start_live', ({ userId, title }) => {
+    if (bannedUsers.has(userId)) {
+      const ban = bannedUsers.get(userId);
+      socket.emit('error', `You are banned from live streaming until ${new Date(ban.end).toISOString()}`);
+      return;
+    }
+    liveUsers.set(userId, { viewers: 0, title: sanitizeInput(title || 'Live Stream') });
+    io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
   });
 
   socket.on('join_live', ({ liveId }) => {
@@ -344,7 +481,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('get_live_list', () => {
-    socket.emit('live_list', [...liveUsers.keys()]);
+    socket.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
   });
 
   socket.on('disconnect', () => {
@@ -367,10 +504,11 @@ io.on('connection', (socket) => {
       if (liveUsers.has(userId)) {
         io.to(`live:${userId}`).emit('live_ended');
         liveUsers.delete(userId);
+        io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
       }
       users.delete(userId);
       onlineUsers--;
-      io.emit('live_list', [...liveUsers.keys()]);
+      io.emit('live_list', [...liveUsers.entries()].map(([userId, { title }]) => ({ userId, title })));
     }
   });
 });
