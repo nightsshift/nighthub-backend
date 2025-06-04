@@ -27,6 +27,7 @@ const stats = {
   messagesSent: 0,
   reportsFiled: 0
 };
+const userTagsMap = new Map(); // Store last used tags per user
 
 // NSFW filter
 const nsfwKeywords = ['explicit', 'nsfw', 'adult', 'inappropriate'];
@@ -250,6 +251,7 @@ io.on('connection', (socket) => {
       socket.emit('error', 'At least one tag is required to join.');
       return;
     }
+    userTagsMap.set(userId, sanitizedTags); // Store tags
     updateTagUsage(sanitizedTags);
 
     const pair = pairedUsers.get(userId);
@@ -494,6 +496,13 @@ io.on('connection', (socket) => {
         if (countdown < 0) {
           clearInterval(countdownInterval);
           disconnectUser(userId, pairId, partnerId, partnerSocketId, socket);
+          // Auto-rejoin with last tags
+          const lastTags = userTagsMap.get(userId);
+          if (lastTags && lastTags.length > 0) {
+            console.log(`Auto-rejoining user ${userId} with tags: ${lastTags}`);
+            socket.emit('rejoin');
+            socket.emit('join', lastTags);
+          }
         }
       }, 1000);
 
