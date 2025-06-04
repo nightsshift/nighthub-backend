@@ -39,11 +39,11 @@ function isNSFW(message) {
 function sanitizeInput(input) {
   if (typeof input !== 'string') return '';
   return input.replace(/[<>&"']/g, (match) => ({
-    '<': '<',
-    '>': '>',
-    '&': '&',
-    '"': '"',
-    "'": '''
+    '<': '&lt;',
+    '>': '&gt;',
+    '&': '&amp;',
+    '"': '&quot;',
+    "'": '&apos;'
   }[match]));
 }
 
@@ -540,33 +540,35 @@ io.on('connection', (socket) => {
     observingChats.forEach(([pairId, sockets]) => {
       const updatedSockets = sockets.filter(id => id !== socket.id);
       if (updatedSockets.length > 0) {
-        adminChatObservers convencional.set(pairId, updatedSockets);
+        adminChatObservers.set(pairId, updatedSockets);
       } else {
         adminChatObservers.delete(pairId);
       }
     });
-    broadcastAdmin();
-  function disconnectUser(userId, pairId, partnerId, socketId, socket) {
+    broadcastAdminData();
+  });
+
+  function disconnectUser(userId, pairId, partnerId, partnerSocketId, socket) {
     if (partnerSocketId) {
-      const partnerSocket = io.sockets.sockets.get(partnerId);
+      const partnerSocket = io.sockets.sockets.get(partnerSocketId);
       if (partnerSocket) {
         partnerSocket.emit('disconnected');
         partnerSocket.leave(pairId);
-        console.log(`Partner ${partnerId} notified and left socket ID ${pairId}`);
+        console.log(`Partner ${partnerId} notified and left room ${pairId}`);
       }
-      pairedUsers.delete(userId);
-      pairedUsers.delete(partnerId);
-      chatLogs.delete(pairId);
-      socket.leave(pairId);
-      console.log(`User ${userId} disconnected from pair ${pairId}`);
-      broadcastAdminData();
     }
-  });
+    pairedUsers.delete(userId);
+    pairedUsers.delete(partnerId);
+    chatLogs.delete(pairId);
+    socket.leave(pairId);
+    console.log(`User ${userId} disconnected from pair ${pairId}`);
+    broadcastAdminData();
+  }
+});
 
-  // Start server
-  const PORT = process.env.PORT || 3000;
-  const HOST = '0.0.0.0';
-  server.listen(PORT, HOST, () => {
-    console.log(`Server running on http://${HOST}:${PORT}`);
-  });
+// Start server
+const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
+server.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
 });
