@@ -48,7 +48,7 @@ function getTrendingTags() {
     tagCounts.set(tag, userSet.size);
   }
   return [...tagCounts.entries()]
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b[1] - b[1])
     .slice(0, 10)
     .map(entry => entry[0]);
 }
@@ -189,41 +189,17 @@ io.on('connection', (socket) => {
       const pairId = user.pairId;
       const pair = chats.get(pairId);
       if (pair) {
-        let seconds = 5;
-        const countdown = setInterval(() => {
-          socket.emit('countdown', seconds);
-          io.to(users.get(pair.userIds.find(id => id !== userId)).socketId).emit('countdown', seconds);
-          seconds--;
-          if (seconds < 0) {
-            clearInterval(countdown);
-            const otherUserId = pair.userIds.find(id => id !== userId);
-            io.to(users.get(otherUserId).socketId).emit('disconnected');
-            chats.delete(pairId);
-            activeChats--;
-            users.get(otherUserId).pairId = null;
-            socket.emit('rejoin');
-            user.pairId = null;
-            if (videoUsers.has(userId)) {
-              videoUsers.delete(userId);
-            }
-          }
-        }, 1000);
-        socket.countdown = countdown;
-      }
-    }
-  });
-
-  socket.on('cancel_disconnect', () => {
-    if (socket.countdown) {
-      clearInterval(socket.countdown);
-      const user = users.get(userId);
-      if (user && user.pairId) {
-        const pair = chats.get(user.pairId);
-        if (pair) {
-          const otherUserId = pair.userIds.find(id => id !== userId);
-          io.to(socket.id).emit('countdown_cancelled');
-          io.to(users.get(otherUserId).socketId).emit('countdown_cancelled');
-        }
+        const otherUserId = pair.userIds.find(id => id !== userId);
+        const otherUser = users.get(otherUserId);
+        io.to(socket.id).emit('disconnected');
+        io.to(users.get(otherUserId).socketId).emit('disconnected');
+        chats.delete(pairId);
+        activeChats--;
+        user.pairId = null;
+        otherUser.pairId = null;
+        // Re-pair both users with their existing tags
+        socket.emit('join', user.tags);
+        io.to(users.get(otherUserId).socketId).emit('join', otherUser.tags);
       }
     }
   });
@@ -542,6 +518,11 @@ io.on('connection', (socket) => {
           chats.delete(user.pairId);
           activeChats--;
           users.get(otherUserId).pairId = null;
+          // Re-pair the other user
+          const otherUser = users.get(otherUserId);
+          if (otherUser) {
+            io.to(users.get(otherUserId).socketId).emit('join', otherUser.tags);
+          }
         }
       }
       if (liveUsers.has(userId)) {
