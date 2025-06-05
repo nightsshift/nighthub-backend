@@ -1,493 +1,273 @@
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const socketIo = require('socket.io');
 const mongoose = require('mongoose');
-const Filter = require('bad-words');
-const cors = require('cors');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io = socketIo(server, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST']
   }
 });
 
-app.use(cors());
-app.use(express.static('public'));
-
 // MongoDB connection
-mongoose.connect('mongodb+srv://<username>:<password>@cluster0.mongodb.net/nighthub?retryWrites=true&w=majority', {
+mongoose.connect('mongodb://localhost/nighthub', {
   useNewUrlParser: true,
   useUnifiedTopology: true
-}).then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+}).then(() => console.log('MongoDB connected')).catch(err => console.error('MongoDB connection error:', err));
 
 // Schemas
-const userSchema = new mongoose.Schema({
-  sessionId: String,
-  socketId: String,
-  tags: [String],
+const PostSchema = new mongoose.Schema({
+  anonymousId: String,
+  content: String,
+  timestamp: { type: Date, default: Date.now },
+  likes: { type: Number, default: 0 },
+  comments: [{
+    anonymousId: String,
+    content: String,
+    timestamp: { type: Date, default: Date.now },
+    likes: { type: Number, default: 0 }
+  }]
+});
+
+const UserSchema = new mongoose.Schema({
+  anonymousId: String,
+  lastActive: { type: Date, default: Date.now },
   isBanned: { type: Boolean, default: false },
-  banUntil: Date,
-  isAdmin: { type: Boolean, default: false }
+  banExpires: { type: Date, default: null }
 });
-const User = mongoose.model('User', userSchema);
 
-const postSchema = new mongoose.Schema({
-  text: String,
-  hashtags: [String],
-  upvotes: { type: Number, default: 0 },
-  downvotes: { type: Number, default: 0 },
-  userId: String,
-  anonymousId: String,
-  createdAt: { type: Date, default: Date.now }
+const Post = mongoose.model('Post', PostSchema);
+const User = mongoose.model('User', UserSchema);
+
+// Middleware
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Clean URL routing
+const pages = ['index', 'chat', 'video', 'social', 'admin', 'live'];
+pages.forEach(page => {
+  app.get(`/${page}`, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', `${page}.html`));
+  });
 });
-const Post = mongoose.model('Post', postSchema);
 
-const commentSchema = new mongoose.Schema({
-  postId: String,
-  parentId: String,
-  text: String,
-  upvotes: { type: Number, default: 0 },
-  downvotes: { type: Number, default: 0 },
-  userId: String,
-  anonymousId: String,
-  createdAt: { type: Date, default: Date.now }
+// Redirect root to /index
+app.get('/', (req, res) => {
+  res.redirect('/index');
 });
-const Comment = mongoose.model('Comment', commentSchema);
 
-const voteSchema = new mongoose.Schema({
-  userId: String,
-  postId: String,
-  commentId: String,
-  voteType: String // 'up' or 'down'
-});
-const Vote = mongoose.model('Vote', voteSchema);
-
-// NSFW filter
-const filter = new Filter();
-filter.addWords('sex', 'porn', 'nude', 'xxx');
-
-// State
+// Socket.IO logic
+let waitingUsers = [];
+let activePairs = new Map();
+const posts = [];
 const users = new Map();
-const pairs = new Map();
-const waitingUsers = new Set();
-const waitingVideoUsers = new Set();
 
-// Utility functions
-function generateSessionId() {
-  return Math.random().toString(36).substring(2, 15);
-}
-
-function generateAnonymousId() {
-  return 'Anon_' + Math.random().toString(36).substring(2, 10);
-}
-
-function extractHashtags(text) {
-  return (text.match(/#\w+/g) || []).map(tag => tag.slice(1).toLowerCase());
-}
-
-// Update trending hashtags every 5 minutes
-async function updateTrendingHashtags() {
-  const hashtags = await Post.aggregate([
-    { $unwind: '$hashtags' },
-    { $group: { _id: { hashtag: '$hashtags', userId: '$userId' } } },
-    { $group: { _id: '$_id.hashtag', userCount: { $sum: 1 } } },
-    { $sort: { userCount: -1 } },
-    { $limit: 10 }
-  ]);
-  io.emit('trending_update', hashtags.map(h => h._id));
-}
-setInterval(updateTrendingHashtags, 300000);
-
-// Socket.IO connection
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // Initialize user
-  const sessionId = generateSessionId();
-  const user = new User({
-    sessionId,
-    socketId: socket.id,
-    tags: [],
-    isAdmin: socket.id === 'admin_socket_id' // Example admin check
-  });
-  user.save().then(() => {
-    users.set(socket.id, user);
-    socket.emit('admin_status', user.isAdmin);
-  });
-
-  socket.on('join', async (tags) => {
-    const now = new Date();
-    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > now)) {
-      socket.emit('banned');
-      socket.disconnect();
-      return;
-    }
-    user.tags = tags.map(tag => tag.toLowerCase());
-    await user.save();
-    users.set(socket.id, user);
-    waitingUsers.add(socket.id);
-    waitingVideoUsers.add(socket.id);
-    socket.emit('waiting_for_pair');
-  });
-
-  socket.on('start_chat', async ({ pairId }) => {
-    if (pairs.has(socket.id)) {
-      socket.emit('error', 'Already in a chat');
-      return;
-    }
-    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned && (!u.banUntil || u.banUntil <= new Date()));
-    if (!partner) {
-      socket.emit('error', 'Partner not found');
-      return;
-    }
-    pairs.set(socket.id, partner.socketId);
-    pairs.set(partner.socketId, socket.id);
-    waitingUsers.delete(socket.id);
-    waitingUsers.delete(partner.socketId);
-    socket.emit('paired', partner.sessionId);
-    io.to(partner.socketId).emit('paired', sessionId);
-  });
-
-  socket.on('start_random_chat', async () => {
-    if (pairs.has(socket.id)) {
-      socket.emit('error', 'Already in a chat');
-      return;
-    }
-    waitingUsers.delete(socket.id);
-    const now = new Date();
-    const availableUsers = Array.from(waitingUsers).filter(id => id !== socket.id && !users.get(id).isBanned && (!users.get(id).banUntil || users.get(id).banUntil <= now));
-    if (availableUsers.length === 0) {
-      waitingUsers.add(socket.id);
+  socket.on('join', (tags) => {
+    socket.tags = tags;
+    waitingUsers.push(socket);
+    if (waitingUsers.length >= 2) {
+      const user1 = waitingUsers.shift();
+      const user2 = waitingUsers.shift();
+      const pairId = `${user1.id}-${user2.id}`;
+      activePairs.set(user1.id, { partner: user2.id, pairId });
+      activePairs.set(user2.id, { partner: user1.id, pairId });
+      user1.emit('paired', pairId);
+      user2.emit('paired', pairId);
+    } else {
       socket.emit('waiting_for_pair');
-      return;
     }
-    const partnerId = availableUsers[Math.floor(Math.random() * availableUsers.length)];
-    const partner = users.get(partnerId);
-    pairs.set(socket.id, partnerId);
-    pairs.set(partnerId, socket.id);
-    waitingUsers.delete(partnerId);
-    socket.emit('paired', partner.sessionId);
-    io.to(partnerId).emit('paired', sessionId);
   });
 
-  socket.on('start_video_call', async ({ pairId }) => {
-    if (pairs.has(socket.id)) {
-      socket.emit('error', 'Already in a call');
-      return;
+  socket.on('start_random_video', () => {
+    if (!waitingUsers.includes(socket) && !activePairs.has(socket.id)) {
+      waitingUsers.push(socket);
+      if (waitingUsers.length >= 2) {
+        const user1 = waitingUsers.shift();
+        const user2 = waitingUsers.shift();
+        const pairId = `${user1.id}-${user2.id}`;
+        activePairs.set(user1.id, { partner: user2.id, pairId });
+        activePairs.set(user2.id, { partner: user1.id, pairId });
+        user1.emit('paired', pairId);
+        user2.emit('paired', pairId);
+      } else {
+        socket.emit('waiting_for_pair');
+      }
     }
-    const partner = Array.from(users.values()).find(u => u.sessionId === pairId && !u.isBanned && (!u.banUntil || u.banUntil <= new Date()));
-    if (!partner) {
-      socket.emit('error', 'Partner not found');
-      return;
-    }
-    pairs.set(socket.id, partner.socketId);
-    pairs.set(partner.socketId, socket.id);
-    waitingVideoUsers.delete(socket.id);
-    waitingVideoUsers.delete(partner.socketId);
-    socket.emit('start_video_call', partner.sessionId);
-    io.to(partner.socketId).emit('start_video_call', sessionId);
   });
 
-  socket.on('start_random_video', async () => {
-    if (pairs.has(socket.id)) {
-      socket.emit('error', 'Already in a call');
-      return;
-    }
-    waitingVideoUsers.delete(socket.id);
-    const now = new Date();
-    const availableUsers = Array.from(waitingVideoUsers).filter(id => id !== socket.id && !users.get(id).isBanned && (!users.get(id).banUntil || users.get(id).banUntil <= now));
-    if (availableUsers.length === 0) {
-      waitingVideoUsers.add(socket.id);
-      socket.emit('waiting_for_pair');
-      return;
-    }
-    const partnerId = availableUsers[Math.floor(Math.random() * availableUsers.length)];
-    const partner = users.get(partnerId);
-    pairs.set(socket.id, partnerId);
-    pairs.set(partnerId, socket.id);
-    waitingVideoUsers.delete(partnerId);
-    socket.emit('paired', partner.sessionId);
-    io.to(partnerId).emit('paired', sessionId);
-  });
-
-  socket.on('message', (msg) => {
-    const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('message', msg);
+  socket.on('start_video_call', ({ pairId }) => {
+    if (activePairs.has(socket.id)) {
+      socket.emit('start_video_call', pairId);
     }
   });
 
   socket.on('webrtc_signal', (data) => {
-    const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('webrtc_signal', data);
+    const pair = activePairs.get(socket.id);
+    if (pair) {
+      io.to(pair.partner).emit('webrtc_signal', data);
     }
   });
 
-  socket.on('new_post', async (text) => {
-    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
-      socket.emit('banned');
-      return;
+  socket.on('message', (msg) => {
+    const pair = activePairs.get(socket.id);
+    if (pair) {
+      io.to(pair.partner).emit('message', msg);
     }
-    const words = text.split(/\s+/).filter(w => w).length;
-    if (words > 100) {
-      socket.emit('error', 'Post exceeds 100 words');
-      return;
-    }
-    if (filter.isProfane(text)) {
-      socket.emit('error', 'Post contains inappropriate content');
-      return;
-    }
-    const hashtags = extractHashtags(text);
-    const post = new Post({
-      text,
-      hashtags,
-      userId: sessionId,
-      anonymousId: generateAnonymousId()
-    });
-    await post.save();
-    io.emit('post', { ...post.toObject(), comments: [] });
-  });
-
-  socket.on('new_comment', async ({ postId, parentId, text }) => {
-    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
-      socket.emit('banned');
-      return;
-    }
-    if (filter.isProfane(text)) {
-      socket.emit('error', 'Comment contains inappropriate content');
-      return;
-    }
-    const comment = new Comment({
-      postId,
-      parentId,
-      text,
-      userId: sessionId,
-      anonymousId: generateAnonymousId()
-    });
-    await comment.save();
-    io.emit('comment', { postId, comment: comment.toObject() });
-  });
-
-  socket.on('vote_post', async ({ id, vote }) => {
-    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
-      socket.emit('banned');
-      return;
-    }
-    const existingVote = await Vote.findOne({ userId: sessionId, postId: id });
-    if (existingVote) {
-      socket.emit('error', 'Already voted');
-      return;
-    }
-    const post = await Post.findById(id);
-    if (!post) {
-      socket.emit('error', 'Post not found');
-      return;
-    }
-    if (vote === 'up') {
-      post.upvotes += 1;
-    } else {
-      post.downvotes += 1;
-    }
-    await post.save();
-    await new Vote({ userId: sessionId, postId: id, voteType: vote }).save();
-    io.emit('vote_update', { type: 'post', id, upvotes: post.upvotes, downvotes: post.downvotes });
-  });
-
-  socket.on('vote_comment', async ({ id, vote }) => {
-    if (users.get(socket.id).isBanned || (user.banUntil && user.banUntil > new Date())) {
-      socket.emit('banned');
-      return;
-    }
-    const existingVote = await Vote.findOne({ userId: sessionId, commentId: id });
-    if (existingVote) {
-      socket.emit('error', 'Already voted');
-      return;
-    }
-    const comment = await Comment.findById(id);
-    if (!comment) {
-      socket.emit('error', 'Comment not found');
-      return;
-    }
-    if (vote === 'up') {
-      comment.upvotes += 1;
-    } else {
-      comment.downvotes += 1;
-    }
-    await comment.save();
-    await new Vote({ userId: sessionId, commentId: id, voteType: vote }).save();
-    io.emit('vote_update', { type: 'comment', id, upvotes: comment.upvotes, downvotes: comment.downvotes });
-  });
-
-  socket.on('get_trending', async () => {
-    await updateTrendingHashtags();
-  });
-
-  socket.on('get_randos', async () => {
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
-    const posts = await Post.find({ createdAt: { $gte: startOfDay } })
-      .sort({ createdAt: -1 })
-      .limit(10);
-    const postsWithComments = await Promise.all(posts.map(async post => ({
-      ...post.toObject(),
-      comments: await Comment.find({ postId: post._id, parentId: null })
-    })));
-    socket.emit('randos_update', postsWithComments);
-  });
-
-  socket.on('get_new', async () => {
-    const posts = await Post.find()
-      .sort({ createdAt: -1 })
-      .limit(10);
-    const postsWithComments = await Promise.all(posts.map(async post => ({
-      ...post.toObject(),
-      comments: await Comment.find({ postId: post._id, parentId: null })
-    })));
-    socket.emit('new_posts', postsWithComments);
-  });
-
-  socket.on('get_hashtag_posts', async (hashtag) => {
-    const posts = await Post.find({ hashtags: hashtag.toLowerCase() })
-      .sort({ createdAt: -1 })
-      .limit(10);
-    const postsWithComments = await Promise.all(posts.map(async post => ({
-      ...post.toObject(),
-      comments: await Comment.find({ postId: post._id, parentId: null })
-    })));
-    socket.emit('hashtag_posts', postsWithComments);
-  });
-
-  socket.on('delete_post', async (postId) => {
-    if (!users.get(socket.id).isAdmin) {
-      socket.emit('error', 'Not authorized');
-      return;
-    }
-    await Post.findByIdAndDelete(postId);
-    await Comment.deleteMany({ postId });
-    await Vote.deleteMany({ postId });
-    io.emit('post_deleted', postId);
-  });
-
-  socket.on('delete_comment', async (commentId) => {
-    if (!users.get(socket.id).isAdmin) {
-      socket.emit('error', 'Not authorized');
-      return;
-    }
-    await Comment.findByIdAndDelete(commentId);
-    await Comment.deleteMany({ parentId: commentId });
-    await Vote.deleteMany({ commentId });
-    io.emit('comment_deleted', commentId);
-  });
-
-  socket.on('temp_ban', async ({ userId, duration }) => {
-    if (!users.get(socket.id).isAdmin) {
-      socket.emit('error', 'Not authorized');
-      return;
-    }
-    const user = await User.findOne({ sessionId: userId });
-    if (!user) {
-      socket.emit('error', 'User not found');
-      return;
-    }
-    user.banUntil = new Date(Date.now() + duration * 60 * 60 * 1000);
-    await user.save();
-    io.to(user.socketId).emit('banned');
-    io.to(user.socketId).disconnectSockets();
-  });
-
-  socket.on('perm_ban', async (userId) => {
-    if (!users.get(socket.id).isAdmin) {
-      socket.emit('error', 'Not authorized');
-      return;
-    }
-    const user = await User.findOne({ sessionId: userId });
-    if (!user) {
-      socket.emit('error', 'User not found');
-      return;
-    }
-    user.isBanned = true;
-    user.banUntil = null;
-    await user.save();
-    io.to(user.socketId).emit('banned');
-    io.to(user.socketId).disconnectSockets();
-  });
-
-  socket.on('send_announcement', async (text) => {
-    if (!users.get(socket.id).isAdmin) {
-      socket.emit('error', 'Not authorized');
-      return;
-    }
-    io.emit('announcement', text);
-  });
-
-  socket.on('get_trending_tags', async () => {
-    const tags = await User.aggregate([
-      { $unwind: '$tags' },
-      { $group: { _id: '$tags', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 10 }
-    ]);
-    socket.emit('trending_tags', tags.map(t => t._id));
   });
 
   socket.on('leave', () => {
-    const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('disconnected');
-      pairs.delete(partnerId);
+    const pair = activePairs.get(socket.id);
+    if (pair) {
+      io.to(pair.partner).emit('disconnected');
+      activePairs.delete(pair.partner);
+      activePairs.delete(socket.id);
     }
-    pairs.delete(socket.id);
-    waitingUsers.delete(socket.id);
-    waitingVideoUsers.delete(socket.id);
+    waitingUsers = waitingUsers.filter(user => user.id !== socket.id);
+  });
+
+  socket.on('get_trending_tags', () => {
+    socket.emit('trending_tags', ['chat', 'video', 'random', 'fun']);
+  });
+
+  socket.on('create_post', async (content) => {
+    const anonymousId = socket.id.slice(0, 6);
+    const post = new Post({ anonymousId, content });
+    await post.save();
+    io.emit('new_post', post);
+  });
+
+  socket.on('get_posts', async () => {
+    const posts = await Post.find().sort({ timestamp: -1 });
+    socket.emit('posts', posts);
+  });
+
+  socket.on('create_comment', async ({ postId, content }) => {
+    const anonymousId = socket.id.slice(0, 6);
+    const post = await Post.findById(postId);
+    if (post) {
+      post.comments.push({ anonymousId, content });
+      await post.save();
+      io.emit('new_comment', { postId, comment: post.comments[post.comments.length - 1] });
+    }
+  });
+
+  socket.on('like_post', async (postId) => {
+    const post = await Post.findById(postId);
+    if (post) {
+      post.likes += 1;
+      await post.save();
+      io.emit('like_post', { postId, likes: post.likes });
+    }
+  });
+
+  socket.on('like_comment', async ({ postId, commentId }) => {
+    const post = await Post.findById(postId);
+    if (post) {
+      const comment = post.comments.id(commentId);
+      if (comment) {
+        comment.likes += 1;
+        await post.save();
+        io.emit('like_comment', { postId, commentId, likes: comment.likes });
+      }
+    }
+  });
+
+  socket.on('admin_login', async (password) => {
+    if (password === 'admin123') {
+      socket.isAdmin = true;
+      socket.emit('admin_authenticated');
+    } else {
+      socket.emit('error', 'Invalid admin password');
+    }
+  });
+
+  socket.on('admin_get_posts', async () => {
+    if (socket.isAdmin) {
+      const posts = await Post.find().sort({ timestamp: -1 });
+      socket.emit('admin_posts', posts);
+    }
+  });
+
+  socket.on('admin_get_users', async () => {
+    if (socket.isAdmin) {
+      const users = await User.find();
+      socket.emit('admin_users', users);
+    }
+  });
+
+  socket.on('admin_get_streams', () => {
+    if (socket.isAdmin) {
+      socket.emit('admin_streams', [{ id: 'stream1', startTime: Date.now(), status: 'live' }]);
+    }
+  });
+
+  socket.on('admin_delete_post', async (postId) => {
+    if (socket.isAdmin) {
+      await Post.findByIdAndDelete(postId);
+      socket.emit('admin_posts', await Post.find().sort({ timestamp: -1 }));
+    }
+  });
+
+  socket.on('admin_delete_comment', async ({ postId, commentId }) => {
+    if (socket.isAdmin) {
+      const post = await Post.findById(postId);
+      if (post) {
+        post.comments.id(commentId).remove();
+        await post.save();
+        socket.emit('admin_posts', await Post.find().sort({ timestamp: -1 }));
+      }
+    }
+  });
+
+  socket.on('admin_temp_ban_user', async (anonymousId) => {
+    if (socket.isAdmin) {
+      let user = await User.findOne({ anonymousId });
+      if (!user) {
+        user = new User({ anonymousId });
+      }
+      user.isBanned = true;
+      user.banExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await user.save();
+      socket.emit('admin_users', await User.find());
+    }
+  });
+
+  socket.on('admin_perm_ban_user', async (anonymousId) => {
+    if (socket.isAdmin) {
+      let user = await User.findOne({ anonymousId });
+      if (!user) {
+        user = new User({ anonymousId });
+      }
+      user.isBanned = !user.isBanned;
+      user.banExpires = null;
+      await user.save();
+      socket.emit('admin_users', await User.find());
+    }
+  });
+
+  socket.on('admin_announcement', (text) => {
+    if (socket.isAdmin) {
+      io.emit('announcement', text);
+    }
   });
 
   socket.on('disconnect', () => {
-    const partnerId = pairs.get(socket.id);
-    if (partnerId) {
-      io.to(partnerId).emit('disconnected');
-      pairs.delete(partnerId);
+    const pair = activePairs.get(socket.id);
+    if (pair) {
+      io.to(pair.partner).emit('disconnected');
+      activePairs.delete(pair.partner);
+      activePairs.delete(socket.id);
     }
-    pairs.delete(socket.id);
-    waitingUsers.delete(socket.id);
-    waitingVideoUsers.delete(socket.id);
-    users.delete(socket.id);
-    User.deleteOne({ socketId: socket.id }).exec();
+    waitingUsers = waitingUsers.filter(user => user.id !== socket.id);
     console.log('User disconnected:', socket.id);
   });
 });
 
-// Intervals for Randos and New posts
-setInterval(async () => {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const posts = await Post.find({ createdAt: { $gte: startOfDay } })
-    .sort({ createdAt: -1 })
-    .limit(10);
-  const postsWithComments = await Promise.all(posts.map(async post => ({
-    ...post.toObject(),
-    comments: await Comment.find({ postId: post._id, parentId: null })
-  })));
-  io.emit('randos_update', postsWithComments);
-}, 60000);
-
-setInterval(async () => {
-  const posts = await Post.find()
-    .sort({ createdAt: -1 })
-    .limit(10);
-  const postsWithComments = await Promise.all(posts.map(async post => ({
-    ...post.toObject(),
-    comments: await Comment.find({ postId: post._id, parentId: null })
-  })));
-  io.emit('new_posts', postsWithComments);
-}, 1000);
-
-// Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
